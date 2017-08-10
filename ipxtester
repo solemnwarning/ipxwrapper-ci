@@ -1,0 +1,497 @@
+#!/usr/bin/perl
+# Run the IPXWrapper test suite in temporary VirtualBox VMs
+# By Daniel Collins (2017)
+# Released to public domain
+
+use strict;
+use warnings;
+
+use feature qw(state);
+
+use Errno qw(ENOENT);
+use Fcntl;
+use FindBin;
+use IPC::Run qw(run binary);
+use IPC::Semaphore;
+use IPC::SysV qw(ftok IPC_CREAT IPC_EXCL SEM_UNDO);
+use Readonly;
+
+Readonly my $AVAILABLE_RESOURCE => 4;
+
+Readonly my $ROOT_DIRECTORY   => $FindBin::Bin;
+Readonly my $IMAGES_DIRECTORY => "$ROOT_DIRECTORY/images";
+Readonly my $TMP_DIRECTORY    => "$ROOT_DIRECTORY/tmp";
+
+Readonly my $BUILD_OS_TYPE  => "Debian_64";
+Readonly my $BUILD_MEM      => 256;
+Readonly my $BUILD_IMAGE    => "$IMAGES_DIRECTORY/ipxtest-build.vdi";
+Readonly my $BUILD_RESOURCE => 1;
+
+Readonly my $DIRECTOR_OS_TYPE => "Debian_64";
+Readonly my $DIRECTOR_MEM     => 256;
+Readonly my $DIRECTOR_IMAGE   => "$IMAGES_DIRECTORY/ipxtest-director.vdi";
+
+Readonly my %TEST_PLATFORMS => (
+	"winXPx86" => {
+		os_type  => "WindowsXP",
+		mem      => 256,
+		resource => 4,
+		
+		main_image => "$IMAGES_DIRECTORY/ipxtest-main-winXPx86.vdi",
+		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-winXPx86.vdi",
+		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-winXPx86.vdi",
+	},
+	
+	"win7x64" => {
+		os_type  => "Windows7_64",
+		mem      => 2048,
+		resource => 4,
+		
+		main_image => "$IMAGES_DIRECTORY/ipxtest-main-win7x64.vdi",
+		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-win7x64.vdi",
+		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-win7x64.vdi",
+	},
+	
+	"win81x86" => {
+		os_type  => "Windows81",
+		mem      => 2048,
+		resource => 4,
+		
+		main_image => "$IMAGES_DIRECTORY/ipxtest-main-win81x86.vdi",
+		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-win81x86.vdi",
+		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-win81x86.vdi",
+	},
+	
+	"win10x64" => {
+		os_type  => "Windows10_64",
+		mem      => 2048,
+		resource => 4,
+		
+		main_image => "$IMAGES_DIRECTORY/ipxtest-main-win10x64.vdi",
+		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-win10x64.vdi",
+		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-win10x64.vdi",
+	},
+);
+
+# ftok() will fail if it can't stat the directory as the key is generated using
+# properties of the inode, not the string passed in.
+Readonly my $SEM_KEY => ftok($ROOT_DIRECTORY)
+	// die "$ROOT_DIRECTORY: $!";
+
+# Install handlers for common exit signals to ensure our VMs/etc are cleaned up
+# before our hold on the semaphore is released if we are killed early.
+$SIG{HUP} = $SIG{INT} = $SIG{TERM} = $SIG{ALRM} = sub
+{
+	my ($sig_name) = @_;
+	
+	cleanup_vms();
+	
+	# Raise the signal again now we've cleaned up so the parent gets the
+	# correct wait status (if we even have one any more).
+	$SIG{$sig_name} = "DEFAULT";
+	kill($sig_name, $$);
+};
+
+if(defined $ENV{SSH_ORIGINAL_COMMAND})
+{
+	if($ENV{SSH_ORIGINAL_COMMAND} =~ m/^\S+\s+build$/s)
+	{
+		cmd_build();
+	}
+	elsif($ENV{SSH_ORIGINAL_COMMAND} =~ m/^\S+\s+test\s+(\S+)$/s)
+	{
+		cmd_test($1);
+	}
+	else{
+		print STDERR "Unexpected SSH_ORIGINAL_COMMAND: ", $ENV{SSH_ORIGINAL_COMMAND}, "\n";
+		exit(42); # EX_USAGE
+	}
+}
+else{
+	if((scalar @ARGV) == 1 && $ARGV[0] eq "init")
+	{
+		cmd_init();
+	}
+	elsif((scalar @ARGV) == 1 && $ARGV[0] eq "build")
+	{
+		cmd_build();
+	}
+	elsif((scalar @ARGV) == 2 && $ARGV[0] eq "test")
+	{
+		cmd_test($ARGV[1]);
+	}
+	else{
+		print STDERR "Usage: $0 init\n";
+		print STDERR "       $0 build < source-tree.tar > build-tree.tar\n";
+		print STDERR "       $0 test <platform> < build-tree.tar\n";
+		exit(42); # EX_USAGE
+	}
+}
+
+sub cmd_init
+{
+	# Delete VMs
+	if(open(my $vbm, "-|", "VBoxManage", "list", "vms"))
+	{
+		while(defined(my $line = <$vbm>))
+		{
+			my ($vm) = ($line =~ m/^"(.*)"/);
+			
+			if(defined($vm) && $vm =~ m/^ipxtest-/)
+			{
+				system("VBoxManage", "unregistervm", $vm, "--delete")
+					and warn "Could not delete VM '$vm'\n";
+			}
+		}
+	}
+	else{
+		warn "Could not execute VBoxManage: $!\n";
+	}
+	
+	# Delete any orphaned disk images and port reservations.
+	foreach my $file(glob("$TMP_DIRECTORY/*"))
+	{
+		unlink($file)
+			or warn "Could not unlink $file: $!\n";
+	}
+	
+	# Create the semaphore.
+	my $sem = IPC::Semaphore->new($SEM_KEY, 1, (0600 | IPC_CREAT | IPC_EXCL))
+		// die "Cannot open semaphore: $!";
+	
+	# Initialise semaphore. Any pending commands may now begin.
+	$sem->setall(0);
+	$sem->op(0, $AVAILABLE_RESOURCE, 0);
+	
+	exit(0);
+}
+
+sub cmd_build
+{
+	binmode(STDIN, ":raw");
+	my $tarball = do { local $/; <STDIN> };
+	
+	claim_resource($BUILD_RESOURCE);
+	
+	print STDERR "--- Setting up environment\n";
+	
+	alarm(600); # If a build takes 10 minutes, something has gone wrong.
+	
+	my $ssh_port = reserve_port();
+	
+	create_vm("build", $BUILD_OS_TYPE, $BUILD_MEM, $BUILD_IMAGE, [
+		[
+			"--nic1"        => "nat",
+			"--nictype1"    => "82540EM",
+			"--macaddress1" => "080027CE7DB8",
+			"--natpf1"      => ",tcp,127.0.0.1,$ssh_port,,22",
+		],
+	]);
+	
+	print STDERR "Waiting for VM to boot...\n";
+	wait_for_success("ssh", "-p" => $ssh_port, "-o" => "ConnectTimeout=1", "ipxtest\@localhost", "true");
+	
+	print STDERR "--- Uploading tree and running build\n";
+	
+	my $build_ok = run([ "ssh", "-p" => $ssh_port, "ipxtest\@localhost", "cd \$(mktemp -d) && tar -xf - >&2 && HOST=i686-w64-mingw32 make >&2 && HOST=i686-w64-mingw32 make tools >&2 && tar -cf - ./" ],
+		"<" => binary, \$tarball);
+	
+	print STDERR "--- Destroying environment\n";
+	
+	exit($build_ok ? 0 : 1);
+}
+
+sub cmd_test
+{
+	my ($platform_name) = @_;
+	
+	binmode(STDIN, ":raw");
+	my $tarball = do { local $/; <STDIN> };
+	
+	my $platform = $TEST_PLATFORMS{$platform_name}
+		// die "Unknown platform. Valid platforms are: ".join(" ", keys(%TEST_PLATFORMS))."\n";
+	
+	my $intnet_a = "ipxtest-$$-a";
+	my $intnet_b = "ipxtest-$$-b";
+	
+	claim_resource($platform->{resource});
+	
+	print STDERR "--- Setting up environment\n";
+	
+	alarm(3600); # Abort eventually if the test stalls
+	
+	my $ssh_port = reserve_port();
+	
+	create_vm("director", $DIRECTOR_OS_TYPE, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
+		[
+			"--nic1"        => "nat",
+			"--nictype1"    => "82540EM",
+			"--macaddress1" => "0800274155B4",
+			"--natpf1"      => ",tcp,127.0.0.1,$ssh_port,,22",
+		],
+		
+		[
+			"--nic2"        => "intnet",
+			"--intnet2"     => $intnet_a,
+			"--nictype2"    => "82540EM",
+			"--macaddress2" => "080027525F9E",
+			"--nicpromisc2" => "allow-all",
+		],
+		
+		[
+			"--nic3"        => "intnet",
+			"--intnet3"     => $intnet_b,
+			"--nictype3"    => "82540EM",
+			"--macaddress3" => "080027F5BE4C",
+			"--nicpromisc3" => "allow-all",
+		],
+	]);
+	
+	create_vm("main", $platform->{os_type}, $platform->{mem}, $platform->{main_image}, [
+		[
+			"--nic1" => "intnet",
+			"--intnet1" => $intnet_a,
+			"--nictype1" => "82540EM",
+			"--macaddress1" => "080027C36AE6",
+			"--nicpromisc1" => "allow-all",
+		],
+		
+		[
+			"--nic2"        => "intnet",
+			"--intnet2"     => $intnet_b,
+			"--nictype2"    => "82540EM",
+			"--macaddress2" => "08002743475C",
+			"--nicpromisc2" => "allow-all",
+		],
+	]);
+	
+	create_vm("dp1", $platform->{os_type}, $platform->{mem}, $platform->{dp1_image}, [
+		[
+			"--nic1"        => "intnet",
+			"--intnet1"     => $intnet_a,
+			"--nictype1"    => "82540EM",
+			"--macaddress1" => "08002748276B",
+			"--nicpromisc1" => "allow-all",
+		],
+	]);
+	
+	create_vm("dp2", $platform->{os_type}, $platform->{mem}, $platform->{dp2_image}, [
+		[
+			"--nic1"        => "intnet",
+			"--intnet1"     => $intnet_a,
+			"--nictype1"    => "82540EM",
+			"--macaddress1" => "08002771C850",
+			"--nicpromisc1" => "allow-all",
+		],
+	]);
+	
+	my $wait_for_vm = sub
+	{
+		my ($command) = @_;
+		
+		print STDERR "Waiting for VM to boot...\n";
+		wait_for_success("ssh", "-p" => $ssh_port, "-o" => "ConnectTimeout=1", "root\@localhost", $command);
+	};
+	
+	$wait_for_vm->("true");
+	$wait_for_vm->("ssh 172.16.1.21 ';'");
+	$wait_for_vm->("ssh 172.16.1.22 ';'");
+	$wait_for_vm->("ssh 172.16.1.23 ';'");
+	
+	run([ "ssh", "-p" => $ssh_port, "root\@localhost", "tar -xf - -C /srv/ipxwrapper/" ],
+		"<" => binary, \$tarball,
+		">&2",
+	)
+	or die "Could not unpack build tree\n";
+	
+	print STDERR "--- Running tests\n";
+	
+	my $test_ok = run([ "ssh", "-tt", "-p" => $ssh_port, "root\@localhost", "cd /srv/ipxwrapper/ && prove -v tests/" ],
+		">&2");
+	
+	print STDERR "--- Destroying environment\n";
+	
+	exit($test_ok ? 0 : 1);
+}
+
+sub claim_resource
+{
+	my ($resource) = @_;
+	
+	state $sem;
+	until(defined($sem = IPC::Semaphore->new($SEM_KEY, 1, 0600)))
+	{
+		die "Cannot open semaphore: $!"
+			unless($!{ENOENT});
+		
+		sleep 1;
+	}
+	
+	while($sem->stat()->otime == 0)
+	{
+		sleep 1;
+	}
+	
+	print STDERR "Waiting for $resource resource units...\n";
+	$sem->op(0, -$resource, SEM_UNDO);
+}
+
+sub reserve_port
+{
+	# TODO: Clean these up
+	
+	my $port = 1024;
+	until(sysopen(my $fh, "$TMP_DIRECTORY/port-$port", O_WRONLY | O_CREAT | O_EXCL, 0644))
+	{
+		++$port;
+	}
+	
+	return $port;
+}
+
+sub wait_for_success
+{
+	my (@command) = @_;
+	
+	# TODO: Timeout?
+	
+	until(run(\@command, ">&" => "/dev/null")) {}
+}
+
+sub do_or_die
+{
+	my (@cmd) = @_;
+	
+	print STDERR "Running [".join("] [", @cmd)."]...\n";
+	
+	run(\@cmd, ">&2")
+		or die "Command exited with status $?\n";
+}
+
+sub create_vm
+{
+	my ($vm_name, $ostype, $mem_mb, $image, $modifyvm_commands) = @_;
+	
+	$vm_name      = "ipxtest-$$-$vm_name";
+	my $disk_path = "$TMP_DIRECTORY/$vm_name.vdi";
+	
+	do_or_die("cp", "--reflink", $image, $disk_path);
+	do_or_die("VBoxManage", "internalcommands", "sethduuid", $disk_path);
+	
+	do_or_die("VBoxManage", "createvm",
+		"--register",
+		"--name"     => $vm_name,
+		"--ostype"   => $ostype);
+	
+	if($ostype =~ m/^WindowsXP/)
+	{
+		# PIIX4 IDE
+		
+		do_or_die("VBoxManage", "storagectl", $vm_name,
+			"--name" => "IDE Controller",
+			"--add" => "ide",
+			"--controller" => "PIIX4",
+			"--hostiocache" => "on");
+		
+		do_or_die("VBoxManage", "storageattach", $vm_name,
+			"--storagectl" => "IDE Controller",
+			"--port" => "0",
+			"--device" => "0",
+			"--type" => "hdd",
+			"--medium" => $disk_path);
+	}
+	else{
+		# AHCI SATA
+		
+		do_or_die("VBoxManage", "storagectl", $vm_name,
+			"--name" => "SATA Controller",
+			"--add" => "sata",
+			"--controller" => "IntelAHCI",
+			"--portcount" => "1",
+			"--hostiocache" => "on");
+		
+		do_or_die("VBoxManage", "storageattach", $vm_name,
+			"--storagectl" => "SATA Controller",
+			"--port" => "0",
+			"--device" => "0",
+			"--type" => "hdd",
+			"--medium" => $disk_path);
+	}
+	
+	if($vm_name !~ m/^Windows/)
+	{
+		# Not Windows, RTC time should be UTC.
+		do_or_die("VBoxManage", "modifyvm", $vm_name, "--rtcuseutc" => "on");
+	}
+	
+	do_or_die("VBoxManage", "modifyvm", $vm_name, "--memory" => $mem_mb);
+	
+	# Stop Windows wasting lots of time trying to find/install an audio driver.
+	do_or_die("VBoxManage", "modifyvm", $vm_name, "--audio" => "none");
+	
+	foreach my $mvm_cmd(@$modifyvm_commands)
+	{
+		do_or_die("VBoxManage", "modifyvm", $vm_name, @$mvm_cmd);
+	}
+	
+	do_or_die("VBoxManage", "startvm", $vm_name, "--type" => "headless");
+}
+
+sub cleanup_vms
+{
+	# Don't override the damn exit status, Perl!
+	local $?;
+	
+	# Stop running VMs
+	
+	if(open(my $vbm, "-|", "VBoxManage", "list", "runningvms"))
+	{
+		while(defined(my $line = <$vbm>))
+		{
+			my ($vm) = ($line =~ m/^"(.*)"/);
+			
+			if(defined($vm) && $vm =~ m/^ipxtest-$$-/)
+			{
+				print STDERR "Powering off VM $vm...\n";
+				system("VBoxManage", "controlvm", $vm, "poweroff")
+					and warn "Could not power off VM $vm\n";
+			}
+		}
+	}
+	else{
+		warn "Could not execute VBoxManage: $!\n";
+	}
+	
+	# Delete VMs
+	
+	if(open(my $vbm, "-|", "VBoxManage", "list", "vms"))
+	{
+		while(defined(my $line = <$vbm>))
+		{
+			my ($vm) = ($line =~ m/^"(.*)"/);
+			
+			if(defined($vm) && $vm =~ m/^ipxtest-$$-/)
+			{
+				print STDERR "Deleting VM $vm...\n";
+				system("VBoxManage", "unregistervm", $vm, "--delete")
+					and warn "Could not delete VM $vm\n";
+			}
+		}
+	}
+	else{
+		warn "Could not execute VBoxManage: $!\n";
+	}
+	
+	# Delete any disk images. Should be a noop unless we bailed out before
+	# registering a VM or the above delete failed.
+	
+	foreach my $image(glob("$TMP_DIRECTORY/ipxtest-$$-*.vdi"))
+	{
+		unlink($image)
+			or warn "Could not unlink $image: $!\n";
+	}
+}
+
+END {
+	cleanup_vms();
+}
