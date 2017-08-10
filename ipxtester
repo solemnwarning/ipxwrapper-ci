@@ -22,11 +22,6 @@ Readonly my $ROOT_DIRECTORY   => $FindBin::Bin;
 Readonly my $IMAGES_DIRECTORY => "$ROOT_DIRECTORY/images";
 Readonly my $TMP_DIRECTORY    => "$ROOT_DIRECTORY/tmp";
 
-Readonly my $BUILD_OS_TYPE  => "Debian_64";
-Readonly my $BUILD_MEM      => 256;
-Readonly my $BUILD_IMAGE    => "$IMAGES_DIRECTORY/ipxtest-build.vdi";
-Readonly my $BUILD_RESOURCE => 1;
-
 Readonly my $DIRECTOR_OS_TYPE => "Debian_64";
 Readonly my $DIRECTOR_MEM     => 256;
 Readonly my $DIRECTOR_IMAGE   => "$IMAGES_DIRECTORY/ipxtest-director.vdi";
@@ -94,11 +89,7 @@ $SIG{HUP} = $SIG{INT} = $SIG{TERM} = $SIG{ALRM} = sub
 
 if(defined $ENV{SSH_ORIGINAL_COMMAND})
 {
-	if($ENV{SSH_ORIGINAL_COMMAND} =~ m/^\S+\s+build$/s)
-	{
-		cmd_build();
-	}
-	elsif($ENV{SSH_ORIGINAL_COMMAND} =~ m/^\S+\s+test\s+(\S+)$/s)
+	if($ENV{SSH_ORIGINAL_COMMAND} =~ m/^\S+\s+test\s+(\S+)$/s)
 	{
 		cmd_test($1);
 	}
@@ -112,17 +103,12 @@ else{
 	{
 		cmd_init();
 	}
-	elsif((scalar @ARGV) == 1 && $ARGV[0] eq "build")
-	{
-		cmd_build();
-	}
 	elsif((scalar @ARGV) == 2 && $ARGV[0] eq "test")
 	{
 		cmd_test($ARGV[1]);
 	}
 	else{
 		print STDERR "Usage: $0 init\n";
-		print STDERR "       $0 build < source-tree.tar > build-tree.tar\n";
 		print STDERR "       $0 test <platform> < build-tree.tar\n";
 		exit(42); # EX_USAGE
 	}
@@ -164,41 +150,6 @@ sub cmd_init
 	$sem->op(0, $AVAILABLE_RESOURCE, 0);
 	
 	exit(0);
-}
-
-sub cmd_build
-{
-	binmode(STDIN, ":raw");
-	my $tarball = do { local $/; <STDIN> };
-	
-	claim_resource($BUILD_RESOURCE);
-	
-	print STDERR "--- Setting up environment\n";
-	
-	alarm(600); # If a build takes 10 minutes, something has gone wrong.
-	
-	my $ssh_port = reserve_port();
-	
-	create_vm("build", $BUILD_OS_TYPE, $BUILD_MEM, $BUILD_IMAGE, [
-		[
-			"--nic1"        => "nat",
-			"--nictype1"    => "82540EM",
-			"--macaddress1" => "080027CE7DB8",
-			"--natpf1"      => ",tcp,127.0.0.1,$ssh_port,,22",
-		],
-	]);
-	
-	print STDERR "Waiting for VM to boot...\n";
-	wait_for_success("ssh", "-p" => $ssh_port, "-o" => "ConnectTimeout=1", "ipxtest\@localhost", "true");
-	
-	print STDERR "--- Uploading tree and running build\n";
-	
-	my $build_ok = run([ "ssh", "-p" => $ssh_port, "ipxtest\@localhost", "cd \$(mktemp -d) && tar -xf - >&2 && HOST=i686-w64-mingw32 make >&2 && HOST=i686-w64-mingw32 make tools >&2 && tar -cf - ./" ],
-		"<" => binary, \$tarball);
-	
-	print STDERR "--- Destroying environment\n";
-	
-	exit($build_ok ? 0 : 1);
 }
 
 sub cmd_test
