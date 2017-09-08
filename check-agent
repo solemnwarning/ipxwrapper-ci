@@ -1,0 +1,57 @@
+#!/usr/bin/perl
+# Wake glados if any jobs are waiting to run on it.
+
+use strict;
+use warnings;
+
+use constant {
+	ORGANISATION   => "solemnwarning",
+	API_KEY        => "...",
+	AGENT_PROVIDES => "queue=ipxwrapper-test",
+	AGENT_HOSTNAME => "glados.solemnwarning.net",
+};
+
+use JSON;
+use LWP::UserAgent;
+use Net::DNS;
+
+my @builds = do {
+	my $ua = LWP::UserAgent->new(
+		env_proxy => 1,
+	);
+	
+	my $response = $ua->get(
+		"https://api.buildkite.com/v2/organizations/".ORGANISATION."/builds?state[]=scheduled&state[]=running",
+		"Authorization" => "Bearer ".API_KEY);
+	
+	if($response->code() != 200)
+	{
+		die "Got HTTP code ", $response->code(), "\n", $response->content(), "\n";
+	}
+	
+	@{ decode_json($response->content()) }
+};
+
+foreach my $build(@builds)
+{
+	foreach my $job(@{ $build->{jobs} })
+	{
+		if($job->{type} eq "script" && $job->{state} eq "scheduled")
+		{
+			if((scalar @{ $job->{agent_query_rules} }) == 1
+				&& $job->{agent_query_rules}->[0] eq AGENT_PROVIDES)
+			{
+				my $res = Net::DNS::Resolver->new();
+				
+				my $ip  = ($res->query(AGENT_HOSTNAME, "A")  ->answer())[0]->address();
+				my $mac = ($res->query(AGENT_HOSTNAME, "TXT")->answer())[0]->txtdata();
+				
+				# Run with qx to discard stdout noise
+				qx(wakeonlan -i $ip $mac);
+				
+				# We've woke the agent, no more to do
+				exit(0);
+			}
+		}
+	}
+}
