@@ -8,7 +8,7 @@ use warnings;
 
 use feature qw(state);
 
-use Errno qw(ENOENT);
+use Errno qw(EEXIST ENOENT);
 use Fcntl;
 use FindBin;
 use IPC::Run qw(run binary);
@@ -294,6 +294,8 @@ sub reserve_port
 	my $port = 1024;
 	until(sysopen(my $fh, "$TMP_DIRECTORY/port-$port", O_WRONLY | O_CREAT | O_EXCL, 0644))
 	{
+		die "Cannot create $TMP_DIRECTORY/port-$port: $!\n"
+			unless($!{EEXIST});
 		++$port;
 	}
 	
