@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Run the IPXWrapper test suite in temporary VirtualBox VMs
-# By Daniel Collins (2017)
+# By Daniel Collins (2017-2019)
 # Released to public domain
 
 use strict;
@@ -11,12 +11,14 @@ use feature qw(state);
 use Errno qw(EEXIST ENOENT);
 use Fcntl;
 use FindBin;
-use IPC::Run qw(run binary);
+use IPC::Run qw(run binary start);
 use IPC::Semaphore;
 use IPC::SysV qw(ftok IPC_CREAT IPC_EXCL SEM_UNDO);
 use Readonly;
+use Term::ANSIColor;
 
 Readonly my $AVAILABLE_RESOURCE => 4;
+Readonly my $PARALLEL_TESTS => 4;
 
 Readonly my $ROOT_DIRECTORY   => $FindBin::Bin;
 Readonly my $IMAGES_DIRECTORY => "$ROOT_DIRECTORY/images";
@@ -162,107 +164,209 @@ sub cmd_test
 	my $platform = $TEST_PLATFORMS{$platform_name}
 		// die "Unknown platform. Valid platforms are: ".join(" ", keys(%TEST_PLATFORMS))."\n";
 	
-	my $intnet_a = "ipxtest-$$-a";
-	my $intnet_b = "ipxtest-$$-b";
-	
 	claim_resource($platform->{resource});
 	
 	print STDERR "--- Setting up environment\n";
 	
 	alarm(3600); # Abort eventually if the test stalls
 	
-	my $ssh_port = reserve_port();
+	my @instances = ();
 	
-	create_vm("director", $DIRECTOR_OS_TYPE, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
-		[
-			"--nic1"        => "nat",
-			"--nictype1"    => "82540EM",
-			"--macaddress1" => "0800274155B4",
-			"--natpf1"      => ",tcp,127.0.0.1,$ssh_port,,22",
-		],
-		
-		[
-			"--nic2"        => "intnet",
-			"--intnet2"     => $intnet_a,
-			"--nictype2"    => "82540EM",
-			"--macaddress2" => "080027525F9E",
-			"--nicpromisc2" => "allow-all",
-		],
-		
-		[
-			"--nic3"        => "intnet",
-			"--intnet3"     => $intnet_b,
-			"--nictype3"    => "82540EM",
-			"--macaddress3" => "080027F5BE4C",
-			"--nicpromisc3" => "allow-all",
-		],
-	]);
-	
-	create_vm("main", $platform->{os_type}, $platform->{mem}, $platform->{main_image}, [
-		[
-			"--nic1" => "intnet",
-			"--intnet1" => $intnet_a,
-			"--nictype1" => "82540EM",
-			"--macaddress1" => "080027C36AE6",
-			"--nicpromisc1" => "allow-all",
-		],
-		
-		[
-			"--nic2"        => "intnet",
-			"--intnet2"     => $intnet_b,
-			"--nictype2"    => "82540EM",
-			"--macaddress2" => "08002743475C",
-			"--nicpromisc2" => "allow-all",
-		],
-	]);
-	
-	create_vm("dp1", $platform->{os_type}, $platform->{mem}, $platform->{dp1_image}, [
-		[
-			"--nic1"        => "intnet",
-			"--intnet1"     => $intnet_a,
-			"--nictype1"    => "82540EM",
-			"--macaddress1" => "08002748276B",
-			"--nicpromisc1" => "allow-all",
-		],
-	]);
-	
-	create_vm("dp2", $platform->{os_type}, $platform->{mem}, $platform->{dp2_image}, [
-		[
-			"--nic1"        => "intnet",
-			"--intnet1"     => $intnet_a,
-			"--nictype1"    => "82540EM",
-			"--macaddress1" => "08002771C850",
-			"--nicpromisc1" => "allow-all",
-		],
-	]);
-	
-	my $wait_for_vm = sub
+	for(my $instance = 1; $instance <= $PARALLEL_TESTS; ++$instance)
 	{
-		my ($command) = @_;
+		my $intnet_a = "ipxtest-$$-${instance}-a";
+		my $intnet_b = "ipxtest-$$-${instance}-b";
 		
-		print STDERR "Waiting for VM to boot...\n";
-		wait_for_success("ssh", "-p" => $ssh_port, "-o" => "ConnectTimeout=1", "root\@localhost", $command);
-	};
+		my $ssh_port = reserve_port();
+		
+		create_vm("${instance}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
+			[
+				"--nic1"        => "nat",
+				"--nictype1"    => "82540EM",
+				"--macaddress1" => "0800274155B4",
+				"--natpf1"      => ",tcp,127.0.0.1,$ssh_port,,22",
+			],
+			
+			[
+				"--nic2"        => "intnet",
+				"--intnet2"     => $intnet_a,
+				"--nictype2"    => "82540EM",
+				"--macaddress2" => "080027525F9E",
+				"--nicpromisc2" => "allow-all",
+			],
+			
+			[
+				"--nic3"        => "intnet",
+				"--intnet3"     => $intnet_b,
+				"--nictype3"    => "82540EM",
+				"--macaddress3" => "080027F5BE4C",
+				"--nicpromisc3" => "allow-all",
+			],
+		]);
+		
+		create_vm("${instance}-main", $platform->{os_type}, $platform->{mem}, $platform->{main_image}, [
+			[
+				"--nic1" => "intnet",
+				"--intnet1" => $intnet_a,
+				"--nictype1" => "82540EM",
+				"--macaddress1" => "080027C36AE6",
+				"--nicpromisc1" => "allow-all",
+			],
+			
+			[
+				"--nic2"        => "intnet",
+				"--intnet2"     => $intnet_b,
+				"--nictype2"    => "82540EM",
+				"--macaddress2" => "08002743475C",
+				"--nicpromisc2" => "allow-all",
+			],
+		]);
+		
+		create_vm("${instance}-dp1", $platform->{os_type}, $platform->{mem}, $platform->{dp1_image}, [
+			[
+				"--nic1"        => "intnet",
+				"--intnet1"     => $intnet_a,
+				"--nictype1"    => "82540EM",
+				"--macaddress1" => "08002748276B",
+				"--nicpromisc1" => "allow-all",
+			],
+		]);
+		
+		create_vm("${instance}-dp2", $platform->{os_type}, $platform->{mem}, $platform->{dp2_image}, [
+			[
+				"--nic1"        => "intnet",
+				"--intnet1"     => $intnet_a,
+				"--nictype1"    => "82540EM",
+				"--macaddress1" => "08002771C850",
+				"--nicpromisc1" => "allow-all",
+			],
+		]);
+		
+		push(@instances, {
+			name     => "ipxtest-$$-${instance}",
+			ssh_port => $ssh_port,
+			free     => 1,
+		});
+	}
 	
-	$wait_for_vm->("true");
-	$wait_for_vm->("ssh 172.16.1.21 ';'");
-	$wait_for_vm->("ssh 172.16.1.22 ';'");
-	$wait_for_vm->("ssh 172.16.1.23 ';'");
+	foreach my $instance(@instances)
+	{
+		my $wait_for_vm = sub
+		{
+			my ($command, $name) = @_;
+			
+			print STDERR "Waiting for ", $instance->{name}, "-${name} to boot...\n";
+			wait_for_success("ssh", "-p" => $instance->{ssh_port}, "-o" => "ConnectTimeout=1", "root\@localhost", $command);
+		};
+		
+		$wait_for_vm->("true", "director");
+		$wait_for_vm->("ssh 172.16.1.21 ';'", "main");
+		$wait_for_vm->("ssh 172.16.1.22 ';'", "dp1");
+		$wait_for_vm->("ssh 172.16.1.23 ';'", "dp2");
+		
+		run([ "ssh", "-p" => $instance->{ssh_port}, "root\@localhost", "tar -xf - -C /srv/ipxwrapper/" ],
+			"<" => binary, \$tarball,
+			">&2",
+		)
+		or die "Could not unpack build tree\n";
+	}
 	
-	run([ "ssh", "-p" => $ssh_port, "root\@localhost", "tar -xf - -C /srv/ipxwrapper/" ],
-		"<" => binary, \$tarball,
-		">&2",
-	)
-	or die "Could not unpack build tree\n";
+	# Gather list of tests to run from the first instance.
+	
+	my $tests_ls = "";
+	run(
+		[ "ssh", "-p" => $instances[0]->{ssh_port}, "root\@localhost", "cd /srv/ipxwrapper/tests/ && ls -1 *.t" ],
+		">" => \$tests_ls,
+		"<"  => "/dev/null")
+		or die "Unable to enumerate tests";
+	
+	my @tests = map {
+		{
+			name     => $_,     # Name of test script (xxx.t)
+			instance => undef,  # Instance running the test (from started until done)
+			started  => 0,      # Has test been started?
+			output   => "",     # Output from test (STDOUT and STDERR)
+			handle   => undef,  # IPC::Run handle (from started until done)
+			done     => 0,      # Has test finished?
+			passed   => undef,  # Did test pass? (after done)
+		}
+	} sort ($tests_ls =~ m/(\S+)/g);
 	
 	print STDERR "--- Running tests\n";
 	
-	my $test_ok = run([ "ssh", "-tt", "-p" => $ssh_port, "root\@localhost", "cd /srv/ipxwrapper/ && prove -v tests/" ],
-		">&2");
+	while(grep { !$_->{done} } @tests)
+	{
+		my ($next_test) = grep { !$_->{started} } @tests;
+		my ($next_free) = grep { $_->{free} } @instances;
+		
+		my $did_work = 0;
+		
+		if(defined($next_test) && defined($next_free))
+		{
+			print STDERR "Starting ", $next_test->{name}, " on ", $next_free->{name}, "\n";
+			
+			$next_test->{handle} = start(
+				[ "ssh", "-tt", "-p" => $next_free->{ssh_port}, "root\@localhost", "cd /srv/ipxwrapper/ && prove -v tests/".$next_test->{name} ],
+				">&" => \($next_test->{output}),
+				"<"  => "/dev/null")
+				or die "Unable to start ".$next_test->{name};
+			
+			$next_free->{free} = 0;
+			
+			$next_test->{instance} = $next_free;
+			$next_test->{started} = 1;
+			
+			$did_work = 1;
+		}
+		
+		foreach my $running_test(grep { $_->{started} && !$_->{done} } @tests)
+		{
+			if(!$running_test->{handle}->pump_nb())
+			{
+				# Process is finished
+				
+				$running_test->{passed} = $running_test->{handle}->finish();
+				$running_test->{handle} = undef;
+				
+				$running_test->{instance}->{free} = 1;
+				$running_test->{instance} = undef;
+				
+				$running_test->{done} = 1;
+				
+				print STDERR "Finished ", $running_test->{name}, "\n";
+				
+				$did_work = 1;
+			}
+		}
+		
+		sleep(1) unless($did_work);
+	}
+	
+	print STDERR "--- Test output\n";
+	
+	foreach my $test(@tests)
+	{
+		print STDERR $test->{output};
+	}
+	
+	my @failed_tests = grep { !$_->{passed} } @tests;
+	if(@failed_tests)
+	{
+		print STDERR color("bright_red");
+		print STDERR "\nThe following test scripts FAILED:\n\n";
+		print STDERR $_->{name}, "\n" foreach(@failed_tests);
+		print STDERR "\n";
+	}
+	else{
+		print STDERR color("bright_green");
+		print STDERR "\nAll test scripts passed!\n\n";
+	}
+	
+	print STDERR color("reset");
 	
 	print STDERR "--- Destroying environment\n";
 	
-	exit($test_ok ? 0 : 1);
+	exit(@failed_tests ? 1 : 0);
 }
 
 sub claim_resource
