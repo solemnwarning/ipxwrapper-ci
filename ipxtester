@@ -8,72 +8,43 @@ use warnings;
 
 use feature qw(state);
 
+use Config::INI::Reader;
 use Errno qw(EEXIST ENOENT);
 use Fcntl;
 use FindBin;
 use IPC::Run qw(run binary start);
 use IPC::Semaphore;
 use IPC::SysV qw(ftok IPC_CREAT IPC_EXCL SEM_UNDO);
-use Readonly;
 use Term::ANSIColor;
 
-Readonly my $AVAILABLE_RESOURCE => 4;
-Readonly my $PARALLEL_TESTS => 4;
+# Configuration variables populated by read_config()
+my $IMAGES_DIRECTORY;
+my $TMP_DIRECTORY;
+my $AVAILABLE_RESOURCE;
+my $MAX_DURATION;
+my $DIRECTOR_OS_TYPE;
+my $DIRECTOR_VCPUS;
+my $DIRECTOR_MEM;
+my $DIRECTOR_IMAGE;
+my %TEST_PLATFORMS;
+my $CONFIG_OK = 0;
 
-Readonly my $ROOT_DIRECTORY   => $FindBin::Bin;
-Readonly my $IMAGES_DIRECTORY => "$ROOT_DIRECTORY/images";
-Readonly my $TMP_DIRECTORY    => "$ROOT_DIRECTORY/tmp";
-
-Readonly my $DIRECTOR_OS_TYPE => "Debian_64";
-Readonly my $DIRECTOR_MEM     => 256;
-Readonly my $DIRECTOR_IMAGE   => "$IMAGES_DIRECTORY/ipxtest-director.vdi";
-
-Readonly my %TEST_PLATFORMS => (
-	"winXPx86" => {
-		os_type  => "WindowsXP",
-		mem      => 256,
-		resource => 4,
-		
-		main_image => "$IMAGES_DIRECTORY/ipxtest-main-winXPx86.vdi",
-		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-winXPx86.vdi",
-		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-winXPx86.vdi",
-	},
-	
-	"win7x64" => {
-		os_type  => "Windows7_64",
-		mem      => 2048,
-		resource => 4,
-		
-		main_image => "$IMAGES_DIRECTORY/ipxtest-main-win7x64.vdi",
-		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-win7x64.vdi",
-		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-win7x64.vdi",
-	},
-	
-	"win81x86" => {
-		os_type  => "Windows81",
-		mem      => 2048,
-		resource => 4,
-		
-		main_image => "$IMAGES_DIRECTORY/ipxtest-main-win81x86.vdi",
-		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-win81x86.vdi",
-		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-win81x86.vdi",
-	},
-	
-	"win10x64" => {
-		os_type  => "Windows10_64",
-		mem      => 2048,
-		resource => 4,
-		
-		main_image => "$IMAGES_DIRECTORY/ipxtest-main-win10x64.vdi",
-		dp1_image  => "$IMAGES_DIRECTORY/ipxtest-dp1-win10x64.vdi",
-		dp2_image  => "$IMAGES_DIRECTORY/ipxtest-dp2-win10x64.vdi",
-	},
-);
+read_config("$FindBin::Bin/ipxtester.ini");
 
 # ftok() will fail if it can't stat the directory as the key is generated using
 # properties of the inode, not the string passed in.
-Readonly my $SEM_KEY => ftok($ROOT_DIRECTORY)
-	// die "$ROOT_DIRECTORY: $!";
+
+my $SEM_KEY = do
+{
+	my $key_path = "$TMP_DIRECTORY/sem.key";
+	
+	unless(-e $key_path)
+	{
+		open(my $sem, ">", $key_path) or die "Unable to create $key_path: $!\n";
+	}
+	
+	ftok($key_path, 1) // die "$key_path: $!\n";
+};
 
 # Install handlers for common exit signals to ensure our VMs/etc are cleaned up
 # before our hold on the semaphore is released if we are killed early.
@@ -139,6 +110,8 @@ sub cmd_init
 	# Delete any orphaned disk images and port reservations.
 	foreach my $file(glob("$TMP_DIRECTORY/*"))
 	{
+		next if($file =~ m/\/sem\.key$/);
+
 		unlink($file)
 			or warn "Could not unlink $file: $!\n";
 	}
@@ -168,18 +141,18 @@ sub cmd_test
 	
 	print STDERR "--- Setting up environment\n";
 	
-	alarm(3600); # Abort eventually if the test stalls
+	alarm($MAX_DURATION); # Abort eventually if the test stalls
 	
 	my @instances = ();
 	
-	for(my $instance = 1; $instance <= $PARALLEL_TESTS; ++$instance)
+	for(my $instance = 1; $instance <= $platform->{workers}; ++$instance)
 	{
 		my $intnet_a = "ipxtest-$$-${instance}-a";
 		my $intnet_b = "ipxtest-$$-${instance}-b";
 		
 		my $ssh_port = reserve_port();
 		
-		create_vm("${instance}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
+		create_vm("${instance}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_VCPUS, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
 			[
 				"--nic1"        => "nat",
 				"--nictype1"    => "82540EM",
@@ -204,7 +177,7 @@ sub cmd_test
 			],
 		]);
 		
-		create_vm("${instance}-main", $platform->{os_type}, $platform->{mem}, $platform->{main_image}, [
+		create_vm("${instance}-main", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{main_image}, [
 			[
 				"--nic1" => "intnet",
 				"--intnet1" => $intnet_a,
@@ -222,7 +195,7 @@ sub cmd_test
 			],
 		]);
 		
-		create_vm("${instance}-dp1", $platform->{os_type}, $platform->{mem}, $platform->{dp1_image}, [
+		create_vm("${instance}-dp1", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp1_image}, [
 			[
 				"--nic1"        => "intnet",
 				"--intnet1"     => $intnet_a,
@@ -232,7 +205,7 @@ sub cmd_test
 			],
 		]);
 		
-		create_vm("${instance}-dp2", $platform->{os_type}, $platform->{mem}, $platform->{dp2_image}, [
+		create_vm("${instance}-dp2", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp2_image}, [
 			[
 				"--nic1"        => "intnet",
 				"--intnet1"     => $intnet_a,
@@ -427,7 +400,7 @@ sub do_or_die
 
 sub create_vm
 {
-	my ($vm_name, $ostype, $mem_mb, $image, $modifyvm_commands) = @_;
+	my ($vm_name, $ostype, $vcpus, $mem_mb, $image, $modifyvm_commands) = @_;
 	
 	$vm_name      = "ipxtest-$$-$vm_name";
 	my $disk_path = "$TMP_DIRECTORY/$vm_name.vdi";
@@ -481,6 +454,7 @@ sub create_vm
 		do_or_die("VBoxManage", "modifyvm", $vm_name, "--rtcuseutc" => "on");
 	}
 	
+	do_or_die("VBoxManage", "modifyvm", $vm_name, "--cpus",  => $vcpus);
 	do_or_die("VBoxManage", "modifyvm", $vm_name, "--memory" => $mem_mb);
 	
 	# Stop Windows wasting lots of time trying to find/install an audio driver.
@@ -498,6 +472,9 @@ sub cleanup_vms
 {
 	# Don't override the damn exit status, Perl!
 	local $?;
+	
+	# Don't try to clean up when we don't know what we're doing.
+	return unless($CONFIG_OK);
 	
 	# Stop running VMs
 	
@@ -547,6 +524,76 @@ sub cleanup_vms
 		unlink($image)
 			or warn "Could not unlink $image: $!\n";
 	}
+}
+
+sub read_config
+{
+	my ($ini_file) = @_;
+	
+	# Throws on error
+	my $ini = Config::INI::Reader->read_file($ini_file);
+	
+	my $ini_val = sub
+	{
+		my ($section, $key, $valid) = @_;
+		
+		my $value = $ini->{$section}->{$key}
+			// die "Missing '$key' property in ".($section eq "_" ? "top-level" : $section)." configuration\n";
+		
+		die "Invalid '$key' property in ".($section eq "_" ? "top-level" : $section)." configuration\n"
+			if(defined($valid) && !$valid->($value));
+		
+		delete $ini->{$section}->{$key};
+		return $value;
+	};
+	
+	my $ini_check = sub
+	{
+		my ($section) = @_;
+		
+		my @keys = keys(%{ $ini->{$section} });
+		if(@keys)
+		{
+			die "Unexpected properties in ".($section eq "_" ? "top-level" : $section)." configuration: ".join(", ", @keys)."\n";
+		}
+	};
+	
+	my $is_pnum = sub { return !!($_[0] =~ m/^[1-9][0-9]*$/); };
+	my $is_dir = sub { return -d $_[0]; };
+	my $is_image = sub { return -f "$IMAGES_DIRECTORY/".$_[0]; };
+	
+	$IMAGES_DIRECTORY = $ini_val->("_", "images directory", $is_dir);
+	$TMP_DIRECTORY    = $ini_val->("_", "tmp directory", $is_dir);
+	
+	$AVAILABLE_RESOURCE = $ini_val->("_", "total resource", $is_pnum);
+	$MAX_DURATION       = $ini_val->("_", "max duration",   $is_pnum);
+	
+	$DIRECTOR_OS_TYPE = $ini_val->("_", "director os");
+	$DIRECTOR_VCPUS   = $ini_val->("_", "director vcpus", $is_pnum);
+	$DIRECTOR_MEM     = $ini_val->("_", "director mem",   $is_pnum);
+	$DIRECTOR_IMAGE   = "$IMAGES_DIRECTORY/".$ini_val->("_", "director image", $is_image);
+	
+	$ini_check->("_");
+	delete $ini->{"_"};
+	
+	foreach my $section(keys %$ini)
+	{
+		$TEST_PLATFORMS{$section} = {
+			os_type  => $ini_val->($section, "os"),
+			vcpus    => $ini_val->($section, "vcpus", $is_pnum),
+			mem      => $ini_val->($section, "mem", $is_pnum),
+			workers  => $ini_val->($section, "workers", $is_pnum),
+			resource => $ini_val->($section, "resource cost", $is_pnum),
+			
+			main_image => "$IMAGES_DIRECTORY/".$ini_val->($section, "main image", $is_image),
+			dp1_image  => "$IMAGES_DIRECTORY/".$ini_val->($section, "dp1 image", $is_image),
+			dp2_image  => "$IMAGES_DIRECTORY/".$ini_val->($section, "dp2 image", $is_image),
+		};
+		
+		$ini_check->($section);
+	}
+	
+	$CONFIG_OK = 1;
 }
 
 END {
