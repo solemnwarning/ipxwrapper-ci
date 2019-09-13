@@ -276,8 +276,6 @@ sub cmd_test
 		
 		if(defined($next_test) && defined($next_free))
 		{
-			print STDERR "Starting ", $next_test->{name}, " on ", $next_free->{name}, "\n";
-			
 			$next_test->{handle} = start(
 				[ "ssh", "-tt", "-p" => $next_free->{ssh_port}, "root\@localhost", "cd /srv/ipxwrapper/ && prove -v tests/".$next_test->{name} ],
 				">&" => \($next_test->{output}),
@@ -306,20 +304,24 @@ sub cmd_test
 				
 				$running_test->{done} = 1;
 				
-				print STDERR "Finished ", $running_test->{name}, "\n";
-				
 				$did_work = 1;
 			}
 		}
 		
+		foreach my $test(@tests)
+		{
+			if($test->{output} ne "")
+			{
+				print STDERR $test->{output};
+				$test->{output} = "";
+				
+				$did_work = 1;
+			}
+			
+			last unless($test->{done});
+		}
+		
 		sleep(1) unless($did_work);
-	}
-	
-	print STDERR "--- Test output\n";
-	
-	foreach my $test(@tests)
-	{
-		print STDERR $test->{output};
 	}
 	
 	my @failed_tests = grep { !$_->{passed} } @tests;
