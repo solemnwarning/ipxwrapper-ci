@@ -239,9 +239,9 @@ sub cmd_test
 		};
 		
 		$wait_for_vm->("true", "director");
-		$wait_for_vm->("ssh 172.16.1.21 ';'", "main");
-		$wait_for_vm->("ssh 172.16.1.22 ';'", "dp1");
-		$wait_for_vm->("ssh 172.16.1.23 ';'", "dp2");
+		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.21 ';'", "main");
+		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.22 ';'", "dp1");
+		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.23 ';'", "dp2");
 		
 		run([ "ssh", "root\@${ip}", "tar -xf - -C /srv/ipxwrapper/" ],
 			"<" => binary, \$tarball,
