@@ -147,16 +147,18 @@ sub cmd_test
 	
 	alarm($MAX_DURATION); # Abort eventually if the test stalls
 	
+	# Register instances and start director VMs
+	
 	my @instances = ();
 	
-	for(my $instance = 1; $instance <= $platform->{workers}; ++$instance)
+	for(my $instance_i = 1; $instance_i <= $platform->{workers}; ++$instance_i)
 	{
-		my $intnet_a = "ipxtest-$$-${instance}-a";
-		my $intnet_b = "ipxtest-$$-${instance}-b";
+		my $intnet_a = "ipxtest-$$-${instance_i}-a";
+		my $intnet_b = "ipxtest-$$-${instance_i}-b";
 		
 		my $iface = reserve_iface();
 		
-		create_vm("${instance}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_VCPUS, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
+		create_vm("${instance_i}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_VCPUS, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
 			[
 				"--nic1"             => "hostonly",
 				"--hostonlyadapter1" => "$iface",
@@ -181,7 +183,47 @@ sub cmd_test
 			],
 		]);
 		
-		create_vm("${instance}-main", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{main_image}, [
+		push(@instances, {
+			name => "ipxtest-$$-${instance_i}",
+			ip   => $INTERFACES{$iface},
+			free => 1,
+		});
+	}
+	
+	# Wait for director VMs to boot and unpack build trees
+	
+	foreach my $instance(@instances)
+	{
+		my $ip = $instance->{ip};
+		
+		my $wait_for_vm = sub
+		{
+			my ($command, $name) = @_;
+			
+			print STDERR "Waiting for ", $instance->{name}, "-${name} to boot...\n";
+			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "root\@${ip}", $command);
+		};
+		
+		$wait_for_vm->("true", "director");
+		
+		run([ "ssh", "root\@${ip}", "tar -xf - -C /srv/ipxwrapper/" ],
+			"<" => binary, \$tarball,
+			">&2",
+		)
+		or die "Could not unpack build tree\n";
+	}
+	
+	# Start Windows VMs
+	# This is done as a seperate step as when running on a fast enough host, Windows 10 seems
+	# to realise that it can't access the SMB share exported from the director VM and cache
+	# that failure rather than retrying whenever we connect and try to map it.
+	
+	for(my $instance_i = 1; $instance_i <= $platform->{workers}; ++$instance_i)
+	{
+		my $intnet_a = "ipxtest-$$-${instance_i}-a";
+		my $intnet_b = "ipxtest-$$-${instance_i}-b";
+		
+		create_vm("${instance_i}-main", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{main_image}, [
 			[
 				"--nic1" => "intnet",
 				"--intnet1" => $intnet_a,
@@ -199,7 +241,7 @@ sub cmd_test
 			],
 		]);
 		
-		create_vm("${instance}-dp1", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp1_image}, [
+		create_vm("${instance_i}-dp1", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp1_image}, [
 			[
 				"--nic1"        => "intnet",
 				"--intnet1"     => $intnet_a,
@@ -209,7 +251,7 @@ sub cmd_test
 			],
 		]);
 		
-		create_vm("${instance}-dp2", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp2_image}, [
+		create_vm("${instance_i}-dp2", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp2_image}, [
 			[
 				"--nic1"        => "intnet",
 				"--intnet1"     => $intnet_a,
@@ -218,13 +260,9 @@ sub cmd_test
 				"--nicpromisc1" => "allow-all",
 			],
 		]);
-		
-		push(@instances, {
-			name => "ipxtest-$$-${instance}",
-			ip   => $INTERFACES{$iface},
-			free => 1,
-		});
 	}
+	
+	# Wait for Windows VMs to boot.
 	
 	foreach my $instance(@instances)
 	{
@@ -238,16 +276,9 @@ sub cmd_test
 			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "root\@${ip}", $command);
 		};
 		
-		$wait_for_vm->("true", "director");
 		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.21 ';'", "main");
 		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.22 ';'", "dp1");
 		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.23 ';'", "dp2");
-		
-		run([ "ssh", "root\@${ip}", "tar -xf - -C /srv/ipxwrapper/" ],
-			"<" => binary, \$tarball,
-			">&2",
-		)
-		or die "Could not unpack build tree\n";
 	}
 	
 	# Gather list of tests to run from the first instance.
