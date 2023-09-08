@@ -36,48 +36,6 @@ user's crontab:
 
     @reboot /mnt/vmstore/ipxtest/ipxtester init
 
-# Setting up network interfaces
-
-`ipxtester` uses a number of dedicated host-only adapters to communicate with
-the virtual machines it creates. Each network needs a DHCP server which assigns
-a fixed IP to the VM.
-
-The adapters and the IP addresses that will be assigned to the VMs should be
-listed in `ipxtester.ini` like so:
-
-    vboxnet4 = 192.168.99.2
-    vboxnet5 = 192.168.99.6
-    vboxnet6 = 192.168.99.10
-    vboxnet7 = 192.168.99.14
-
-The `make-interfaces.pl` script is provided to set up a pool of interfaces and
-their associated DHCP servers. The script's output can be pasted into your
-`ipxwrapper.ini` file.
-
-    $ ./make-interfaces.pl 4 192.168.99.0/24
-    ; VBoxManage hostonlyif create
-    ; VBoxManage hostonlyif ipconfig vboxnet4 --ip 192.168.99.1 --netmask 255.255.255.252
-    ; VBoxManage dhcpserver add --ifname vboxnet4 --ip 192.168.99.1 --netmask 255.255.255.252 --lowerip 192.168.99.2 --upperip 192.168.99.2 --enable
-    vboxnet4 = 192.168.99.2
-    
-    ; VBoxManage hostonlyif create
-    ; VBoxManage hostonlyif ipconfig vboxnet5 --ip 192.168.99.5 --netmask 255.255.255.252
-    ; VBoxManage dhcpserver add --ifname vboxnet5 --ip 192.168.99.5 --netmask 255.255.255.252 --lowerip 192.168.99.6 --upperip 192.168.99.6 --enable
-    vboxnet5 = 192.168.99.6
-    
-    ; VBoxManage hostonlyif create
-    ; VBoxManage hostonlyif ipconfig vboxnet6 --ip 192.168.99.9 --netmask 255.255.255.252
-    ; VBoxManage dhcpserver add --ifname vboxnet6 --ip 192.168.99.9 --netmask 255.255.255.252 --lowerip 192.168.99.10 --upperip 192.168.99.10 --enable
-    vboxnet6 = 192.168.99.10
-    
-    ; VBoxManage hostonlyif create
-    ; VBoxManage hostonlyif ipconfig vboxnet7 --ip 192.168.99.13 --netmask 255.255.255.252
-    ; VBoxManage dhcpserver add --ifname vboxnet7 --ip 192.168.99.13 --netmask 255.255.255.252 --lowerip 192.168.99.14 --upperip 192.168.99.14 --enable
-    vboxnet7 = 192.168.99.14
-
-Make sure the subnet you use doesn't conflict with one used on your network or
-the ones used by the test suite (172.16.1.0/24 and 172.16.2.0/24).
-
 # Preparing the "director" Virtual Machine
 
 The director VM is the Linux part of the test environment. It is where the

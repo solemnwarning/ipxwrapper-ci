@@ -27,11 +27,13 @@ my $DIRECTOR_VCPUS;
 my $DIRECTOR_MEM;
 my $DIRECTOR_IMAGE;
 my %TEST_PLATFORMS;
-my %INTERFACES;
 my $CONFIG_OK = 0;
 
-# Interfaces which have been locked
-my @my_interfaces = ();
+my $MIN_PORT = 2048;
+my $MAX_PORT = 3071;
+
+# Ports which have been locked
+my @my_ports = ();
 
 read_config("$FindBin::Bin/ipxtester.ini");
 
@@ -156,14 +158,17 @@ sub cmd_test
 		my $intnet_a = "ipxtest-$$-${instance_i}-a";
 		my $intnet_b = "ipxtest-$$-${instance_i}-b";
 		
-		my $iface = reserve_iface();
+		my $ssh_port = reserve_port();
 		
 		create_vm("${instance_i}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_VCPUS, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
 			[
-				"--nic1"             => "hostonly",
-				"--hostonlyadapter1" => "$iface",
+				"--nic1"             => "nat",
 				"--nictype1"         => "82540EM",
 				"--macaddress1"      => "0800274155B4",
+			],
+			
+			[
+				"--natpf1" => "ssh,tcp,,${ssh_port},,22",
 			],
 			
 			[
@@ -184,9 +189,9 @@ sub cmd_test
 		]);
 		
 		push(@instances, {
-			name => "ipxtest-$$-${instance_i}",
-			ip   => $INTERFACES{$iface},
-			free => 1,
+			name     => "ipxtest-$$-${instance_i}",
+			ssh_port => $ssh_port,
+			free     => 1,
 		});
 	}
 	
@@ -194,19 +199,19 @@ sub cmd_test
 	
 	foreach my $instance(@instances)
 	{
-		my $ip = $instance->{ip};
+		my $ssh_port = $instance->{ssh_port};
 		
 		my $wait_for_vm = sub
 		{
 			my ($command, $name) = @_;
 			
 			print STDERR "Waiting for ", $instance->{name}, "-${name} to boot...\n";
-			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "root\@${ip}", $command);
+			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "-p" => $ssh_port, "root\@127.0.0.1", $command);
 		};
 		
 		$wait_for_vm->("true", "director");
 		
-		run([ "ssh", "root\@${ip}", "tar -xf - -C /srv/ipxwrapper/" ],
+		run([ "ssh", "-p" => $ssh_port, "root\@127.0.0.1", "tar -xf - -C /srv/ipxwrapper/" ],
 			"<" => binary, \$tarball,
 			">&2",
 		)
@@ -266,14 +271,14 @@ sub cmd_test
 	
 	foreach my $instance(@instances)
 	{
-		my $ip = $instance->{ip};
+		my $ssh_port = $instance->{ssh_port};
 		
 		my $wait_for_vm = sub
 		{
 			my ($command, $name) = @_;
 			
 			print STDERR "Waiting for ", $instance->{name}, "-${name} to boot...\n";
-			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "root\@${ip}", $command);
+			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "-p" => $ssh_port, "root\@127.0.0.1", $command);
 		};
 		
 		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.21 ';'", "main");
@@ -285,7 +290,7 @@ sub cmd_test
 	
 	my $tests_ls = "";
 	run(
-		[ "ssh", "root\@".$instances[0]->{ip}, "cd /srv/ipxwrapper/tests/ && ls -1 *.t" ],
+		[ "ssh", "-p" => $instances[0]->{ssh_port}, "root\@127.0.0.1", "cd /srv/ipxwrapper/tests/ && ls -1 *.t" ],
 		">" => \$tests_ls,
 		"<"  => "/dev/null")
 		or die "Unable to enumerate tests";
@@ -314,7 +319,7 @@ sub cmd_test
 		if(defined($next_test) && defined($next_free))
 		{
 			$next_test->{handle} = start(
-				[ "ssh", "-tt", "root\@".$next_free->{ip}, "cd /srv/ipxwrapper/ && prove -v tests/".$next_test->{name} ],
+				[ "ssh", "-tt", "-p" => $next_free->{ssh_port}, "root\@127.0.0.1", "cd /srv/ipxwrapper/ && prove -v tests/".$next_test->{name} ],
 				">&" => \($next_test->{output}),
 				"<"  => "/dev/null")
 				or die "Unable to start ".$next_test->{name};
@@ -403,21 +408,21 @@ sub claim_resource
 	$sem->op(0, -$resource, SEM_UNDO);
 }
 
-sub reserve_iface
+sub reserve_port
 {
-	foreach my $iface(keys %INTERFACES)
+	for(my $i = $MIN_PORT; $i <= $MAX_PORT; ++$i)
 	{
-		if(sysopen(my $fh, "$TMP_DIRECTORY/iface-$iface", O_WRONLY | O_CREAT | O_EXCL, 0644))
+		if(sysopen(my $fh, "$TMP_DIRECTORY/port-$i", O_WRONLY | O_CREAT | O_EXCL, 0644))
 		{
-			push(@my_interfaces, $iface);
-			return $iface;
+			push(@my_ports, $i);
+			return $i;
 		}
 		
-		die "Cannot create $TMP_DIRECTORY/iface-$iface: $!\n"
+		die "Cannot create $TMP_DIRECTORY/port-$i: $!\n"
 			unless($!{EEXIST});
 	}
 	
-	die "No network interfaces available!\n";
+	die "No ports available!\n";
 }
 
 sub wait_for_success
@@ -566,10 +571,10 @@ sub cleanup_vms
 			or warn "Could not unlink $image: $!\n";
 	}
 	
-	# Release network interfaces we claimed
-	foreach my $iface(@my_interfaces)
+	# Release any ports we claimed
+	foreach my $port(@my_ports)
 	{
-		my $path = "$TMP_DIRECTORY/iface-$iface";
+		my $path = "$TMP_DIRECTORY/port-$port";
 		
 		unlink($path)
 			or warn "Could not unlink $path: $!\n";
@@ -623,9 +628,12 @@ sub read_config
 	$DIRECTOR_MEM     = $ini_val->("_", "director mem",   $is_pnum);
 	$DIRECTOR_IMAGE   = "$IMAGES_DIRECTORY/".$ini_val->("_", "director image", $is_image);
 	
-	foreach my $key(grep { m/^vboxnet\S+/ } keys(%{ $ini->{"_"} }))
+	$MIN_PORT = $ini_val->("_", "min port", $is_pnum) if(defined $ini->{"_"}->{"min port"});
+	$MAX_PORT = $ini_val->("_", "max port", $is_pnum) if(defined $ini->{"_"}->{"max port"});
+	
+	if($MIN_PORT > $MAX_PORT)
 	{
-		$INTERFACES{$key} = $ini_val->("_", $key, sub { 1; });
+		die "Configured min port ($MIN_PORT) is greater than max port ($MAX_PORT)\n";
 	}
 	
 	$ini_check->("_");
