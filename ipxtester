@@ -15,6 +15,7 @@ use FindBin;
 use IPC::Run qw(run binary start);
 use IPC::Semaphore;
 use IPC::SysV qw(ftok IPC_CREAT IPC_EXCL SEM_UNDO);
+use POSIX qw(:signal_h);
 use Term::ANSIColor;
 
 # Configuration variables populated by read_config()
@@ -22,6 +23,7 @@ my $IMAGES_DIRECTORY;
 my $TMP_DIRECTORY;
 my $AVAILABLE_RESOURCE;
 my $MAX_DURATION;
+my $HYPERVISOR;
 my $DIRECTOR_OS_TYPE;
 my $DIRECTOR_VCPUS;
 my $DIRECTOR_MEM;
@@ -34,6 +36,9 @@ my $MAX_PORT = 3071;
 
 # Ports which have been locked
 my @my_ports = ();
+
+my @launched_vms = ();
+my %qemu_network_ports = ();
 
 read_config("$FindBin::Bin/ipxtester.ini");
 
@@ -96,21 +101,25 @@ else{
 sub cmd_init
 {
 	# Delete VMs
-	if(open(my $vbm, "-|", "VBoxManage", "list", "vms"))
+	
+	if($HYPERVISOR eq "virtualbox")
 	{
-		while(defined(my $line = <$vbm>))
+		if(open(my $vbm, "-|", "VBoxManage", "list", "vms"))
 		{
-			my ($vm) = ($line =~ m/^"(.*)"/);
-			
-			if(defined($vm) && $vm =~ m/^ipxtest-/)
+			while(defined(my $line = <$vbm>))
 			{
-				system("VBoxManage", "unregistervm", $vm, "--delete")
-					and warn "Could not delete VM '$vm'\n";
+				my ($vm) = ($line =~ m/^"(.*)"/);
+				
+				if(defined($vm) && $vm =~ m/^ipxtest-/)
+				{
+					system("VBoxManage", "unregistervm", $vm, "--delete")
+						and warn "Could not delete VM '$vm'\n";
+				}
 			}
 		}
-	}
-	else{
-		warn "Could not execute VBoxManage: $!\n";
+		else{
+			warn "Could not execute VBoxManage: $!\n";
+		}
 	}
 	
 	# Delete any orphaned disk images and port reservations.
@@ -161,31 +170,29 @@ sub cmd_test
 		my $ssh_port = reserve_port();
 		
 		create_vm("${instance_i}-director", $DIRECTOR_OS_TYPE, $DIRECTOR_VCPUS, $DIRECTOR_MEM, $DIRECTOR_IMAGE, [
-			[
-				"--nic1"             => "nat",
-				"--nictype1"         => "82540EM",
-				"--macaddress1"      => "0800274155B4",
-			],
+			{
+				model => "82540EM",
+				mac   => "0800274155B4",
+				
+				network => "nat",
+				portfwds => [
+					[ "tcp", $ssh_port, 22 ],
+				],
+			},
 			
-			[
-				"--natpf1" => "ssh,tcp,,${ssh_port},,22",
-			],
+			{
+				model => "82540EM",
+				mac   => "080027525F9E",
+				
+				network => $intnet_a,
+			},
 			
-			[
-				"--nic2"        => "intnet",
-				"--intnet2"     => $intnet_a,
-				"--nictype2"    => "82540EM",
-				"--macaddress2" => "080027525F9E",
-				"--nicpromisc2" => "allow-all",
-			],
-			
-			[
-				"--nic3"        => "intnet",
-				"--intnet3"     => $intnet_b,
-				"--nictype3"    => "82540EM",
-				"--macaddress3" => "080027F5BE4C",
-				"--nicpromisc3" => "allow-all",
-			],
+			{
+				model => "82540EM",
+				mac   => "080027F5BE4C",
+				
+				network => $intnet_b,
+			},
 		]);
 		
 		push(@instances, {
@@ -229,41 +236,29 @@ sub cmd_test
 		my $intnet_b = "ipxtest-$$-${instance_i}-b";
 		
 		create_vm("${instance_i}-main", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{main_image}, [
-			[
-				"--nic1" => "intnet",
-				"--intnet1" => $intnet_a,
-				"--nictype1" => "82540EM",
-				"--macaddress1" => "080027C36AE6",
-				"--nicpromisc1" => "allow-all",
-			],
+			{
+				mac     => "080027C36AE6",
+				network => $intnet_a,
+			},
 			
-			[
-				"--nic2"        => "intnet",
-				"--intnet2"     => $intnet_b,
-				"--nictype2"    => "82540EM",
-				"--macaddress2" => "08002743475C",
-				"--nicpromisc2" => "allow-all",
-			],
+			{
+				mac     => "08002743475C",
+				network => $intnet_b,
+			},
 		]);
 		
 		create_vm("${instance_i}-dp1", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp1_image}, [
-			[
-				"--nic1"        => "intnet",
-				"--intnet1"     => $intnet_a,
-				"--nictype1"    => "82540EM",
-				"--macaddress1" => "08002748276B",
-				"--nicpromisc1" => "allow-all",
-			],
+			{
+				mac     => "08002748276B",
+				network => $intnet_a,
+			},
 		]);
 		
 		create_vm("${instance_i}-dp2", $platform->{os_type}, $platform->{vcpus}, $platform->{mem}, $platform->{dp2_image}, [
-			[
-				"--nic1"        => "intnet",
-				"--intnet1"     => $intnet_a,
-				"--nictype1"    => "82540EM",
-				"--macaddress1" => "08002771C850",
-				"--nicpromisc1" => "allow-all",
-			],
+			{
+				mac     => "08002771C850",
+				network => $intnet_a,
+			},
 		]);
 	}
 	
@@ -446,72 +441,190 @@ sub do_or_die
 
 sub create_vm
 {
-	my ($vm_name, $ostype, $vcpus, $mem_mb, $image, $modifyvm_commands) = @_;
+	my ($vm_name, $ostype, $vcpus, $mem_mb, $image, $guest_nics) = @_;
+	
+	my ($ext) = ($image =~ m/\.(\w+)$/);
 	
 	$vm_name      = "ipxtest-$$-$vm_name";
-	my $disk_path = "$TMP_DIRECTORY/$vm_name.vdi";
+	my $disk_path = "$TMP_DIRECTORY/$vm_name.$ext";
 	
 	do_or_die("cp", "--reflink", $image, $disk_path);
-	do_or_die("VBoxManage", "internalcommands", "sethduuid", $disk_path);
 	
-	do_or_die("VBoxManage", "createvm",
-		"--register",
-		"--name"     => $vm_name,
-		"--ostype"   => $ostype);
-	
-	if($ostype =~ m/^WindowsXP/)
+	if($HYPERVISOR eq "virtualbox")
 	{
-		# PIIX4 IDE
+		do_or_die("VBoxManage", "internalcommands", "sethduuid", $disk_path);
 		
-		do_or_die("VBoxManage", "storagectl", $vm_name,
-			"--name" => "IDE Controller",
-			"--add" => "ide",
-			"--controller" => "PIIX4",
-			"--hostiocache" => "on");
+		do_or_die("VBoxManage", "createvm",
+			"--register",
+			"--name"     => $vm_name,
+			"--ostype"   => $ostype);
 		
-		do_or_die("VBoxManage", "storageattach", $vm_name,
-			"--storagectl" => "IDE Controller",
-			"--port" => "0",
-			"--device" => "0",
-			"--type" => "hdd",
-			"--medium" => $disk_path);
+		if($ostype =~ m/^WindowsXP/)
+		{
+			# PIIX4 IDE
+			
+			do_or_die("VBoxManage", "storagectl", $vm_name,
+				"--name" => "IDE Controller",
+				"--add" => "ide",
+				"--controller" => "PIIX4",
+				"--hostiocache" => "on");
+			
+			do_or_die("VBoxManage", "storageattach", $vm_name,
+				"--storagectl" => "IDE Controller",
+				"--port" => "0",
+				"--device" => "0",
+				"--type" => "hdd",
+				"--medium" => $disk_path);
+		}
+		else{
+			# AHCI SATA
+			
+			do_or_die("VBoxManage", "storagectl", $vm_name,
+				"--name" => "SATA Controller",
+				"--add" => "sata",
+				"--controller" => "IntelAHCI",
+				"--portcount" => "1",
+				"--hostiocache" => "on");
+			
+			do_or_die("VBoxManage", "storageattach", $vm_name,
+				"--storagectl" => "SATA Controller",
+				"--port" => "0",
+				"--device" => "0",
+				"--type" => "hdd",
+				"--medium" => $disk_path);
+		}
+		
+		if($vm_name !~ m/^Windows/)
+		{
+			# Not Windows, RTC time should be UTC.
+			do_or_die("VBoxManage", "modifyvm", $vm_name, "--rtcuseutc" => "on");
+		}
+		
+		do_or_die("VBoxManage", "modifyvm", $vm_name, "--cpus",  => $vcpus);
+		do_or_die("VBoxManage", "modifyvm", $vm_name, "--memory" => $mem_mb);
+		
+		# Stop Windows wasting lots of time trying to find/install an audio driver.
+		do_or_die("VBoxManage", "modifyvm", $vm_name, "--audio" => "none");
+		
+		my $iface_n = 1;
+		foreach my $nic(@$guest_nics)
+		{
+			my @nic_params = ();
+			
+			if($nic->{network} eq "nat")
+			{
+				push(@nic_params,
+					"--nic${iface_n}" => "nat");
+			}
+			else{
+				push(@nic_params,
+					"--nic${iface_n}"        => "intnet",
+					"--intnet${iface_n}"     => $nic->{network},
+					"--nicpromisc${iface_n}" => "allow-all",
+				);
+			}
+			
+			push(@nic_params,
+				"--nictype${iface_n}"    => "82540EM",
+				"--macaddress${iface_n}" => $nic->{mac},
+			);
+			
+			foreach my $fwd(@{ $nic->{portfwds} // [] })
+			{
+				push(@nic_params,
+					"--natpf${iface_n}" => "XXX,".$fwd->[0].",,".$fwd->[1].",,".$fwd->[2],
+				);
+			}
+			
+			do_or_die("VBoxManage", "modifyvm", $vm_name, @nic_params);
+			
+			++$iface_n;
+		}
+		
+		do_or_die("VBoxManage", "startvm", $vm_name, "--type" => "headless");
 	}
-	else{
-		# AHCI SATA
-		
-		do_or_die("VBoxManage", "storagectl", $vm_name,
-			"--name" => "SATA Controller",
-			"--add" => "sata",
-			"--controller" => "IntelAHCI",
-			"--portcount" => "1",
-			"--hostiocache" => "on");
-		
-		do_or_die("VBoxManage", "storageattach", $vm_name,
-			"--storagectl" => "SATA Controller",
-			"--port" => "0",
-			"--device" => "0",
-			"--type" => "hdd",
-			"--medium" => $disk_path);
-	}
-	
-	if($vm_name !~ m/^Windows/)
+	elsif($HYPERVISOR eq "qemu-kvm")
 	{
-		# Not Windows, RTC time should be UTC.
-		do_or_die("VBoxManage", "modifyvm", $vm_name, "--rtcuseutc" => "on");
+		my @qemu_params = (
+			"-enable-kvm",
+			"-smp" => "cpus=1,cores=$vcpus,threads=1,sockets=1,maxcpus=$vcpus",
+			"-m" => $mem_mb,
+			"-hda" => $disk_path,
+		);
+		
+		if(1)
+		{
+			my $vnc_port = reserve_port();
+			push(@qemu_params, "-vnc" => ":$vnc_port");
+		}
+		else{
+			push(@qemu_params, "-vnc" => "none");
+		}
+		
+		if($ostype eq "WindowsXP")
+		{
+			push(@qemu_params, "-machine" => "pc");
+		}
+		else{
+			push(@qemu_params, "-machine" => "q35");
+		}
+		
+		if($ostype =~ m/^Windows/)
+		{
+			push(@qemu_params, "-rtc" => "base=localtime");
+		}
+		else{
+			push(@qemu_params, "-rtc" => "base=utc");
+		}
+		
+		my $socket_n = 0;
+		foreach my $nic(@$guest_nics)
+		{
+			my $nic_param = "";
+			
+			if($nic->{network} eq "nat")
+			{
+				$nic_param = "user,restrict=on";
+			}
+			else{
+				$qemu_network_ports{ $nic->{network} } //= reserve_port();
+				
+				$nic_param = "socket,id=n".(++$socket_n);
+				$nic_param .= ",mcast=230.0.0.1:".$qemu_network_ports{ $nic->{network} };
+			}
+			
+			my $mac = $nic->{mac};
+			$mac =~ s/^(..)(..)(..)(..)(..)(..)$/$1:$2:$3:$4:$5:$6/;
+			
+			$nic_param .= ",mac=$mac";
+			$nic_param .= ",model=e1000-82545em";
+			
+			foreach my $fwd(@{ $nic->{portfwds} // [] })
+			{
+				$nic_param .= ",hostfwd=".$fwd->[0].":127.0.0.1:".$fwd->[1]."-:".$fwd->[2];
+			}
+			
+			push(@qemu_params, "-nic" => $nic_param);
+		}
+		
+		print STDERR "About to run qemu: qemu-system-x86_64 ", join(" ", @qemu_params), "\n";
+		
+		my $pid = fork();
+		if($pid == -1)
+		{
+			die "fork: $!\n";
+		}
+		elsif($pid == 0)
+		{
+			exec("qemu-system-x86_64", @qemu_params);
+			die "Unable to execute qemu-system-x86_64: $!\n";
+		}
+		
+		push(@launched_vms, {
+			pid => $pid,
+			disk => $disk_path,
+		});
 	}
-	
-	do_or_die("VBoxManage", "modifyvm", $vm_name, "--cpus",  => $vcpus);
-	do_or_die("VBoxManage", "modifyvm", $vm_name, "--memory" => $mem_mb);
-	
-	# Stop Windows wasting lots of time trying to find/install an audio driver.
-	do_or_die("VBoxManage", "modifyvm", $vm_name, "--audio" => "none");
-	
-	foreach my $mvm_cmd(@$modifyvm_commands)
-	{
-		do_or_die("VBoxManage", "modifyvm", $vm_name, @$mvm_cmd);
-	}
-	
-	do_or_die("VBoxManage", "startvm", $vm_name, "--type" => "headless");
 }
 
 sub cleanup_vms
@@ -522,53 +635,73 @@ sub cleanup_vms
 	# Don't try to clean up when we don't know what we're doing.
 	return unless($CONFIG_OK);
 	
-	# Stop running VMs
-	
-	if(open(my $vbm, "-|", "VBoxManage", "list", "runningvms"))
+	if($HYPERVISOR eq "virtualbox")
 	{
-		while(defined(my $line = <$vbm>))
+		# Stop running VMs
+		
+		if(open(my $vbm, "-|", "VBoxManage", "list", "runningvms"))
 		{
-			my ($vm) = ($line =~ m/^"(.*)"/);
-			
-			if(defined($vm) && $vm =~ m/^ipxtest-$$-/)
+			while(defined(my $line = <$vbm>))
 			{
-				print STDERR "Powering off VM $vm...\n";
-				system("VBoxManage", "controlvm", $vm, "poweroff")
-					and warn "Could not power off VM $vm\n";
+				my ($vm) = ($line =~ m/^"(.*)"/);
+				
+				if(defined($vm) && $vm =~ m/^ipxtest-$$-/)
+				{
+					print STDERR "Powering off VM $vm...\n";
+					system("VBoxManage", "controlvm", $vm, "poweroff")
+						and warn "Could not power off VM $vm\n";
+				}
 			}
 		}
-	}
-	else{
-		warn "Could not execute VBoxManage: $!\n";
-	}
-	
-	# Delete VMs
-	
-	if(open(my $vbm, "-|", "VBoxManage", "list", "vms"))
-	{
-		while(defined(my $line = <$vbm>))
+		else{
+			warn "Could not execute VBoxManage: $!\n";
+		}
+		
+		# Delete VMs
+		
+		if(open(my $vbm, "-|", "VBoxManage", "list", "vms"))
 		{
-			my ($vm) = ($line =~ m/^"(.*)"/);
-			
-			if(defined($vm) && $vm =~ m/^ipxtest-$$-/)
+			while(defined(my $line = <$vbm>))
 			{
-				print STDERR "Deleting VM $vm...\n";
-				system("VBoxManage", "unregistervm", $vm, "--delete")
-					and warn "Could not delete VM $vm\n";
+				my ($vm) = ($line =~ m/^"(.*)"/);
+				
+				if(defined($vm) && $vm =~ m/^ipxtest-$$-/)
+				{
+					print STDERR "Deleting VM $vm...\n";
+					system("VBoxManage", "unregistervm", $vm, "--delete")
+						and warn "Could not delete VM $vm\n";
+				}
 			}
 		}
+		else{
+			warn "Could not execute VBoxManage: $!\n";
+		}
+		
+		# Delete any disk images. Should be a noop unless we bailed out before
+		# registering a VM or the above delete failed.
+		
+		foreach my $image(glob("$TMP_DIRECTORY/ipxtest-$$-*.vdi"))
+		{
+			unlink($image)
+				or warn "Could not unlink $image: $!\n";
+		}
 	}
-	else{
-		warn "Could not execute VBoxManage: $!\n";
-	}
-	
-	# Delete any disk images. Should be a noop unless we bailed out before
-	# registering a VM or the above delete failed.
-	
-	foreach my $image(glob("$TMP_DIRECTORY/ipxtest-$$-*.vdi"))
+	elsif($HYPERVISOR eq "qemu-kvm")
 	{
-		unlink($image)
-			or warn "Could not unlink $image: $!\n";
+		# Stop running VMs.
+		
+		foreach my $vm(@launched_vms)
+		{
+			kill(SIGTERM, $vm->{pid});
+		}
+		
+		foreach my $vm(@launched_vms)
+		{
+			waitpid($vm->{pid}, 0);
+			
+			unlink($vm->{disk})
+				or warn "Could not unlink ".$vm->{disk}.": $!\n";
+		}
 	}
 	
 	# Release any ports we claimed
@@ -635,6 +768,11 @@ sub read_config
 	{
 		die "Configured min port ($MIN_PORT) is greater than max port ($MAX_PORT)\n";
 	}
+	
+	$HYPERVISOR = $ini_val->("_", "hypervisor", sub
+	{
+		return $_[0] eq "virtualbox" || $_[0] eq "qemu-kvm";
+	});
 	
 	$ini_check->("_");
 	delete $ini->{"_"};
