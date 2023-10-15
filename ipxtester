@@ -590,7 +590,7 @@ sub create_vm
 				$qemu_network_ports{ $nic->{network} } //= reserve_port();
 				
 				$nic_param = "socket,id=n".(++$socket_n);
-				$nic_param .= ",mcast=230.0.0.1:".$qemu_network_ports{ $nic->{network} };
+				$nic_param .= ",mcast=230.0.0.1:".$qemu_network_ports{ $nic->{network} }.",localaddr=127.0.0.1";
 			}
 			
 			my $mac = $nic->{mac};
