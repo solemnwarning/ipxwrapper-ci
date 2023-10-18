@@ -1,6 +1,6 @@
 #!/usr/bin/perl
-# Run the IPXWrapper test suite in temporary VirtualBox VMs
-# By Daniel Collins (2017-2019)
+# Run the IPXWrapper test suite in temporary VirtualBox/QEMU VMs
+# By Daniel Collins (2017-2023)
 # Released to public domain
 
 use strict;
@@ -38,7 +38,7 @@ my $MAX_PORT = 3071;
 my @my_ports = ();
 
 my @launched_vms = ();
-my %qemu_network_ports = ();
+my $qemu_hub = undef;
 
 read_config("$FindBin::Bin/ipxtester.ini");
 
@@ -151,6 +151,11 @@ sub cmd_test
 	
 	my $platform = $TEST_PLATFORMS{$platform_name}
 		// die "Unknown platform. Valid platforms are: ".join(" ", keys(%TEST_PLATFORMS))."\n";
+	
+	if($HYPERVISOR eq "qemu-kvm")
+	{
+		$qemu_hub = QemuHub->new();
+	}
 	
 	claim_resource($platform->{resource});
 	
@@ -577,6 +582,8 @@ sub create_vm
 			push(@qemu_params, "-rtc" => "base=utc");
 		}
 		
+		my @qemu_fds = ();
+		
 		my $socket_n = 0;
 		foreach my $nic(@$guest_nics)
 		{
@@ -587,10 +594,14 @@ sub create_vm
 				$nic_param = "user,restrict=on";
 			}
 			else{
-				$qemu_network_ports{ $nic->{network} } //= reserve_port();
+				my $net_socket = $qemu_hub->get_port_socket($nic->{network});
 				
 				$nic_param = "socket,id=n".(++$socket_n);
-				$nic_param .= ",mcast=230.0.0.1:".$qemu_network_ports{ $nic->{network} }.",localaddr=127.0.0.1";
+				$nic_param .= ",fd=".fileno($net_socket);
+				
+				# Store a temporary copy of qemu_fd so it stays open until the
+				# fork() call.
+				push(@qemu_fds, $net_socket);
 			}
 			
 			my $mac = $nic->{mac};
@@ -799,4 +810,165 @@ sub read_config
 
 END {
 	cleanup_vms();
+}
+
+# The QemuHub class provides packet forwarding between multiple guests in a way
+# similar to VirtualBox "internal networks".
+#
+# "networks" are created on demand as "ports" (like hub ports) are added to
+# them, and any packets sent to the socket for a port are forwarded to every
+# other port on the "network".
+#
+# Call the get_port_socket() method for each network in each guest to obtain
+# the socket to be passed to QEMU using the "-nic socket,fd=<fileno>" argument.
+#
+# "Why not just use QEMUs built-in multicast networking?" I hear you ask, see:
+# https://bugs.launchpad.net/qemu/+bug/761469
+
+package QemuHub;
+
+use Fcntl;
+use IO::FDPass;
+use IO::Select;
+use Socket;
+
+sub new
+{
+	my ($class) = @_;
+	
+	# The "network registration socket" is used for registering a new network with the child
+	# process. Whenever a new network is registered, we create another socketpair for adding
+	# ports to that network and send one end of it over this socketpair.
+	
+	socketpair(my $net_registration_sock1, my $net_registration_sock2, AF_UNIX, SOCK_DGRAM, 0)
+		or die "socketpair: $!";
+	
+	# Pipe used for detecting the parent process exiting (EOF).
+	pipe(my $pipe_reader, my $pipe_writer)
+		or die "pipe: $!";
+	
+	my $pid = fork()
+		// die "fork: $!";
+	
+	if($pid == 0)
+	{
+		$net_registration_sock1 = undef;
+		$pipe_writer = undef;
+		
+		child_main($net_registration_sock2, $pipe_reader);
+	}
+	else{
+		return bless({
+			net_registration_sock => $net_registration_sock1,
+			pipe_writer => $pipe_writer,
+			
+			networks => {},
+		}, $class);
+	}
+}
+
+sub get_port_socket
+{
+	my ($self, $network) = @_;
+	
+	unless(defined $self->{networks}->{$network})
+	{
+		socketpair(my $port_registration_sock1, my $port_registration_sock2, AF_UNIX, SOCK_DGRAM, 0)
+			or die "socketpair: $!";
+		
+		IO::FDPass::send(fileno($self->{net_registration_sock}), fileno($port_registration_sock2))
+			or die "send failed: $!";
+		
+		$self->{networks}->{$network} = $port_registration_sock1;
+	}
+	
+	socketpair(my $port_sock1, my $port_sock2, AF_UNIX, SOCK_DGRAM, 0)
+		or die "socketpair: $!";
+	
+	IO::FDPass::send(fileno($self->{networks}->{$network}), fileno($port_sock2))
+		or die "send failed: $!";
+	
+	# Clear the close-on-exec flag so the descriptor survives the
+	# exec() call into qemu.
+	my $flags = fcntl($port_sock1, F_GETFD, 0) or die "fcntl F_GETFD: $!";
+	fcntl($port_sock1, F_SETFD, $flags & ~FD_CLOEXEC) or die "fcntl F_SETFD: $!";
+	
+	return $port_sock1;
+}
+
+sub child_main
+{
+	my ($net_registration_sock, $pipe_reader) = @_;
+	
+	my @networks = ();
+	
+	my $select = IO::Select->new($net_registration_sock, $pipe_reader);
+	
+	while(1)
+	{
+		my @ready = $select->can_read();
+		
+		if(grep { $_ eq $pipe_reader } @ready)
+		{
+			# The pipe is readable, parent process must have gone away and closed the
+			# write end, we should follow.
+			
+			exit(0);
+		}
+		
+		if(grep { $_ eq $net_registration_sock } @ready)
+		{
+			# A new network has been registered
+			
+			my $fd = IO::FDPass::recv(fileno($net_registration_sock));
+			die "recv failed: $!" if($fd < 0);
+			
+			open my $fh, "+<&=$fd"
+				or die "unable to convert file descriptor to handle: $!";
+			
+			push(@networks, {
+				port_registration_socket => $fh,
+				port_sockets => [],
+			});
+			
+			$select->add($fh);
+		}
+		
+		foreach my $network(@networks)
+		{
+			if(grep { $_ eq $network->{port_registration_socket} } @ready)
+			{
+				# A new port has been added to this network.
+				
+				my $fd = IO::FDPass::recv(fileno($network->{port_registration_socket}));
+				die "recv failed: $!" if($fd < 0);
+				
+				open my $fh, "+<&=$fd"
+					or die "unable to convert file descriptor to handle: $!";
+				
+				push(@{ $network->{port_sockets} }, $fh);
+				
+				$select->add($fh);
+			}
+			
+			foreach my $port(@{ $network->{port_sockets} })
+			{
+				if(grep { $_ eq $port } @ready)
+				{
+					# One of the ports transmitted a packet.
+					# Forward to all other ports on the same network.
+					
+					my $pkt;
+					my $len = sysread($port, $pkt, 65536)
+						// die "sysread: $!";
+					
+					foreach my $other_port(@{ $network->{port_sockets} })
+					{
+						next if($other_port eq $port);
+						syswrite($other_port, $pkt, $len);
+					}
+				}
+			}
+		}
+	}
 }
