@@ -11,7 +11,9 @@ use feature qw(state);
 use Config::INI::Reader;
 use Errno qw(EEXIST ENOENT);
 use Fcntl;
+use File::Temp;
 use FindBin;
+use IO::Handle;
 use IPC::Run qw(run binary start);
 use IPC::Semaphore;
 use IPC::SysV qw(ftok IPC_CREAT IPC_EXCL SEM_UNDO);
@@ -228,6 +230,20 @@ sub cmd_test
 			">&2",
 		)
 		or die "Could not unpack build tree\n";
+		
+		if($platform->{os_type} eq "Windows98")
+		{
+			# Install a wrapper script to alias ssh to ice9r.
+			my $ssh_wrapper = File::Temp->new();
+			print {$ssh_wrapper} "#!/bin/bash\n";
+			print {$ssh_wrapper} "host=\"\$1\"\n";
+			print {$ssh_wrapper} "shift\n";
+			print {$ssh_wrapper} "exec ice9r \"\$host\" -- \"\$\@\"\n";
+			$ssh_wrapper->flush();
+			
+			chmod(0755, "$ssh_wrapper") or die;
+			do_or_die("scp", "-P" => $ssh_port, "$ssh_wrapper", "root\@127.0.0.1:/usr/local/bin/ssh");
+		}
 	}
 	
 	# Start Windows VMs
@@ -281,9 +297,20 @@ sub cmd_test
 			wait_for_success("ssh", "-o" => "ConnectTimeout=1", "-p" => $ssh_port, "root\@127.0.0.1", $command);
 		};
 		
-		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.21 ';'", "main");
-		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.22 ';'", "dp1");
-		$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.23 ';'", "dp2");
+		if($platform->{os_type} eq "Windows98")
+		{
+			#$wait_for_vm->("timeout 5s ice9r 172.16.1.21 COMMAND.COM -e 'COMMAND.COM /C EXIT'", "main");
+			#$wait_for_vm->("timeout 5s ice9r 172.16.1.22 COMMAND.COM -e 'COMMAND.COM /C EXIT'", "dp1");
+			#$wait_for_vm->("timeout 5s ice9r 172.16.1.23 COMMAND.COM -e 'COMMAND.COM /C EXIT'", "dp2");
+			$wait_for_vm->("timeout 5s ice9r 172.16.1.21 'Z:\\tools\\osversion.exe'", "main");
+			$wait_for_vm->("timeout 5s ice9r 172.16.1.22 'Z:\\tools\\osversion.exe'", "dp1");
+			$wait_for_vm->("timeout 5s ice9r 172.16.1.23 'Z:\\tools\\osversion.exe'", "dp2");
+		}
+		else{
+			$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.21 ';'", "main");
+			$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.22 ';'", "dp1");
+			$wait_for_vm->("ssh -o ConnectTimeout=1 172.16.1.23 ';'", "dp2");
+		}
 	}
 	
 	# Gather list of tests to run from the first instance.
@@ -464,7 +491,7 @@ sub create_vm
 			"--name"     => $vm_name,
 			"--ostype"   => $ostype);
 		
-		if($ostype =~ m/^WindowsXP/)
+		if($ostype =~ m/^Windows(XP|98)/)
 		{
 			# PIIX4 IDE
 			
@@ -557,6 +584,35 @@ sub create_vm
 			"-hda" => $disk_path,
 		);
 		
+		if($ostype eq "Windows98")
+		{
+			# We need the Windows 98 VMs to have unique hostnames, which we generate
+			# from one of the assigned MAC addresses and then inject into the VM as a
+			# registry export on a floppy, which the AUTOEXEC.BAT in the image imports
+			# at boot before Windows is initialized...
+			
+			my ($mac) = map { $_->{mac} } @$guest_nics;
+			my $hostname = "IPXW".substr($mac, 6, 6);
+			
+			my $floppy_img = "$TMP_DIRECTORY/$vm_name.fda";
+			
+			my $auto_reg = File::Temp->new();
+			print {$auto_reg} "REGEDIT4\r\n";
+			print {$auto_reg} "\r\n";
+			print {$auto_reg} "[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName]\r\n";
+			print {$auto_reg} "\"ComputerName\"=\"$hostname\"\r\n";
+			print {$auto_reg} "\r\n";
+			$auto_reg->flush();
+			
+			do_or_die("truncate", "--size" => "".(1440 * 1024), "$floppy_img");
+			do_or_die("mformat", "-i" => "$floppy_img", "-f" => "1440");
+			do_or_die("mcopy", "-i" => "$floppy_img", "$auto_reg", "::AUTOIMP.REG");
+			
+			push(@qemu_params, "-fda" => "$floppy_img");
+			
+			push(@qemu_params, "-vga" => "cirrus");
+		}
+		
 		if(1)
 		{
 			my $vnc_port = reserve_port();
@@ -566,7 +622,15 @@ sub create_vm
 			push(@qemu_params, "-vnc" => "none");
 		}
 		
-		if($ostype eq "WindowsXP")
+# 		if($ostype eq "Windows98")
+# 		{
+# 			push(@qemu_params,
+# 				"-machine" => "pc",
+# 				"-cpu" => "pentium2",
+# 				"-no-hpet",
+# 			);
+# 		}
+		if($ostype eq "Windows98" || $ostype eq "WindowsXP")
 		{
 			push(@qemu_params, "-machine" => "pc");
 		}
@@ -608,7 +672,14 @@ sub create_vm
 			$mac =~ s/^(..)(..)(..)(..)(..)(..)$/$1:$2:$3:$4:$5:$6/;
 			
 			$nic_param .= ",mac=$mac";
-			$nic_param .= ",model=e1000-82545em";
+			
+			if($ostype eq "Windows98")
+			{
+				$nic_param .= ",model=pcnet";
+			}
+			else{
+				$nic_param .= ",model=e1000-82545em";
+			}
 			
 			foreach my $fwd(@{ $nic->{portfwds} // [] })
 			{
