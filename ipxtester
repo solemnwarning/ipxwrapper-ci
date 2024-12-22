@@ -608,9 +608,9 @@ sub create_vm
 			do_or_die("mformat", "-i" => "$floppy_img", "-f" => "1440");
 			do_or_die("mcopy", "-i" => "$floppy_img", "$auto_reg", "::AUTOIMP.REG");
 			
-			push(@qemu_params, "-fda" => "$floppy_img");
+			push(@qemu_params, "-drive", "file=${floppy_img},format=raw,index=0,if=floppy");
 			
-			push(@qemu_params, "-vga" => "cirrus");
+			push(@qemu_params, "-vga" => "std");
 		}
 		
 		if(1)
