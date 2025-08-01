@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Run the IPXWrapper test suite in temporary VirtualBox/QEMU VMs
-# By Daniel Collins (2017-2023)
+# By Daniel Collins (2017-2025)
 # Released to public domain
 
 use strict;
@@ -579,7 +579,7 @@ sub create_vm
 	{
 		my @qemu_params = (
 			"-enable-kvm",
-			"-smp" => "cpus=1,cores=$vcpus,threads=1,sockets=1,maxcpus=$vcpus",
+			"-smp" => "$vcpus",
 			"-m" => $mem_mb,
 			"-hda" => $disk_path,
 		);
@@ -636,6 +636,11 @@ sub create_vm
 		}
 		else{
 			push(@qemu_params, "-machine" => "q35");
+		}
+		
+		if($ostype eq "Windows11_64")
+		{
+			push(@qemu_params, "-cpu" => "SandyBridge-v1");
 		}
 		
 		if($ostype =~ m/^Windows/)
