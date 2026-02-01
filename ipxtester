@@ -779,7 +779,7 @@ sub cleanup_vms
 		
 		foreach my $vm(@launched_vms)
 		{
-			kill(SIGTERM, $vm->{pid});
+			kill(SIGKILL, $vm->{pid});
 		}
 		
 		foreach my $vm(@launched_vms)
