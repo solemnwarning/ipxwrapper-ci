@@ -11,6 +11,7 @@ use feature qw(state);
 use Config::INI::Reader;
 use Errno qw(EEXIST ENOENT);
 use Fcntl;
+use File::Path qw(make_path remove_tree);
 use File::Temp;
 use FindBin;
 use IO::Handle;
@@ -93,9 +94,14 @@ else{
 	{
 		cmd_test($ARGV[1]);
 	}
+	elsif((scalar @ARGV) == 4 && $ARGV[0] eq "test" && $ARGV[1] eq "--coverage")
+	{
+		cmd_test($ARGV[3], $ARGV[2]);
+	}
 	else{
 		print STDERR "Usage: $0 init\n";
 		print STDERR "       $0 test <platform> < build-tree.tar\n";
+		print STDERR "       $0 test --coverage <coverage directory> <platform> < build-tree.tar\n";
 		exit(42); # EX_USAGE
 	}
 }
@@ -146,7 +152,7 @@ sub cmd_init
 
 sub cmd_test
 {
-	my ($platform_name) = @_;
+	my ($platform_name, $coverage_output) = @_;
 	
 	binmode(STDIN, ":raw");
 	my $tarball = do { local $/; <STDIN> };
@@ -162,6 +168,16 @@ sub cmd_test
 	claim_resource($platform->{resource});
 	
 	print STDERR "--- Setting up environment\n";
+	
+	if(defined $coverage_output)
+	{
+		if(-e $coverage_output)
+		{
+			remove_tree($coverage_output, { keep_root => 1 });
+		}
+		
+		make_path($coverage_output);
+	}
 	
 	alarm($MAX_DURATION); # Abort eventually if the test stalls
 	
@@ -407,6 +423,41 @@ sub cmd_test
 	}
 	
 	print STDERR color("reset");
+	
+	if(defined $coverage_output)
+	{
+		print STDERR "--- Downloading coverage data to ${coverage_output}\n";
+		
+		foreach my $instance(@instances)
+		{
+			my $download_coverage = sub
+			{
+				my ($ip, $name) = @_;
+				
+				my $ssh_port = $instance->{ssh_port};
+				
+				my $gcov_prefix = "";
+				run([ "ssh", "-p" => $ssh_port, "root\@127.0.0.1", "ssh ${ip} IF EXIST \%GCOV_PREFIX\% ECHO \%GCOV_PREFIX\%" ],
+					">" => \$gcov_prefix,
+					"<" => "/dev/null")
+					or die "Unable to get GCOV_PREFIX path";
+				
+				$gcov_prefix =~ s/\r?\n$//;
+				$gcov_prefix =~ s/\\/\//g;
+				
+				if($gcov_prefix ne "")
+				{
+					do_or_die("ssh", "-p" => $ssh_port, "root\@127.0.0.1", "rm -rf /tmp/coverage");
+					do_or_die("ssh", "-p" => $ssh_port, "root\@127.0.0.1", "scp -O -r ${ip}:${gcov_prefix} /tmp/coverage");
+					do_or_die("scp", "-P" => $ssh_port, "-r", "root\@127.0.0.1:/tmp/coverage", "${coverage_output}/${name}");
+				}
+			};
+			
+			$download_coverage->("172.16.1.21", $instance->{name}."-main");
+			$download_coverage->("172.16.1.22", $instance->{name}."-dp1");
+			$download_coverage->("172.16.1.23", $instance->{name}."-dp2");
+		}
+	}
 	
 	print STDERR "--- Destroying environment\n";
 	
