@@ -531,10 +531,10 @@ sub create_vm
 	$vm_name      = "ipxtest-$$-$vm_name";
 	my $disk_path = "$TMP_DIRECTORY/$vm_name.$ext";
 	
-	do_or_die("cp", "--reflink", $image, $disk_path);
-	
 	if($HYPERVISOR eq "virtualbox")
 	{
+		do_or_die("cp", "--reflink", $image, $disk_path);
+		
 		do_or_die("VBoxManage", "internalcommands", "sethduuid", $disk_path);
 		
 		do_or_die("VBoxManage", "createvm",
@@ -628,6 +628,8 @@ sub create_vm
 	}
 	elsif($HYPERVISOR eq "qemu-kvm")
 	{
+		do_or_die("qemu-img", "create", "-f" => "qcow2", "-b" => $image, "-F" => "qcow2", $disk_path);
+		
 		my @qemu_params = (
 			"-enable-kvm",
 			"-smp" => "$vcpus",
