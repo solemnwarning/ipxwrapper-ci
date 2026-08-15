@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Run the IPXWrapper test suite in temporary VirtualBox/QEMU VMs
-# By Daniel Collins (2017-2025)
+# By Daniel Collins (2017-2026)
 # Released to public domain
 
 use strict;
@@ -14,6 +14,7 @@ use Fcntl;
 use File::Path qw(make_path remove_tree);
 use File::Temp;
 use FindBin;
+use Getopt::Long;
 use IO::Handle;
 use IPC::Run qw(run binary start);
 use IPC::Semaphore;
@@ -78,7 +79,7 @@ if(defined $ENV{SSH_ORIGINAL_COMMAND})
 {
 	if($ENV{SSH_ORIGINAL_COMMAND} =~ m/^\S+\s+test\s+(\S+)$/s)
 	{
-		cmd_test($1);
+		cmd_test($1, undef, 0);
 	}
 	else{
 		print STDERR "Unexpected SSH_ORIGINAL_COMMAND: ", $ENV{SSH_ORIGINAL_COMMAND}, "\n";
@@ -90,20 +91,36 @@ else{
 	{
 		cmd_init();
 	}
-	elsif((scalar @ARGV) == 2 && $ARGV[0] eq "test")
-	{
-		cmd_test($ARGV[1]);
-	}
-	elsif((scalar @ARGV) == 4 && $ARGV[0] eq "test" && $ARGV[1] eq "--coverage")
-	{
-		cmd_test($ARGV[3], $ARGV[2]);
-	}
 	else{
-		print STDERR "Usage: $0 init\n";
-		print STDERR "       $0 test <platform> < build-tree.tar\n";
-		print STDERR "       $0 test --coverage <coverage directory> <platform> < build-tree.tar\n";
-		exit(42); # EX_USAGE
+		my $coverage_output = undef;
+		my $max_retries = 0;
+		
+		unless(GetOptions(
+			"coverage=s" => \$coverage_output,
+			"max-retries=i" => \$max_retries,
+		)) {
+			usage();
+		}
+		
+		if((scalar @ARGV) == 2 && $ARGV[0] eq "test")
+		{
+			cmd_test($ARGV[1], $coverage_output, $max_retries);
+		}
+		else{
+			usage();
+		}
 	}
+}
+
+sub usage
+{
+	print STDERR "Usage: $0 init\n";
+	print STDERR "       $0 test\n";
+	print STDERR "           [--coverage <coverage directory>]\n";
+	print STDERR "           [--max-retries n]\n";
+	print STDERR "           <platform> < build-tree.tar\n";
+	
+	exit(42); # EX_USAGE
 }
 
 sub cmd_init
@@ -152,7 +169,7 @@ sub cmd_init
 
 sub cmd_test
 {
-	my ($platform_name, $coverage_output) = @_;
+	my ($platform_name, $coverage_output, $max_retries) = @_;
 	
 	binmode(STDIN, ":raw");
 	my $tarball = do { local $/; <STDIN> };
@@ -347,6 +364,7 @@ sub cmd_test
 			handle   => undef,  # IPC::Run handle (from started until done)
 			done     => 0,      # Has test finished?
 			passed   => undef,  # Did test pass? (after done)
+			retries  => 0,      # How many times has the test been retried
 		}
 	} sort ($tests_ls =~ m/(\S+)/g);
 	
@@ -387,7 +405,16 @@ sub cmd_test
 				$running_test->{instance}->{free} = 1;
 				$running_test->{instance} = undef;
 				
-				$running_test->{done} = 1;
+				if(!($running_test->{passed}) && $running_test->{retries} < $max_retries)
+				{
+					$running_test->{started} = 0;
+					$running_test->{retries} += 1;
+					
+					$running_test->{output} .= "\nTest ".$running_test->{name}." failed, retrying...\n\n";
+				}
+				else{
+					$running_test->{done} = 1;
+				}
 				
 				$did_work = 1;
 			}
@@ -420,6 +447,16 @@ sub cmd_test
 	else{
 		print STDERR color("bright_green");
 		print STDERR "\nAll test scripts passed!\n\n";
+		
+		my @retried_tests = grep { $_->{retries} > 0 } @tests;
+		if(@retried_tests)
+		{
+			print STDERR color("yellow");
+			
+			print STDERR "The following test scripts did not pass first time:\n\n";
+			print STDERR $_->{name}, " (", $_->{retries}, " retries)\n" foreach(@retried_tests);
+			print STDERR "\n";
+		}
 	}
 	
 	print STDERR color("reset");
